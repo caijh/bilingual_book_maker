@@ -216,6 +216,7 @@ def test_plan_mode_preserves_translated_imported_nav_and_manifest(
         language="zh-hans",
     )
     loader.plan_mode = True
+    loader.plan_classify = "all"
     loader.translate_tags = "auto"
     loader.quiet = True
 
@@ -232,6 +233,51 @@ def test_plan_mode_preserves_translated_imported_nav_and_manifest(
     assert "&lt;T&gt;Source navigation heading&lt;/T&gt;" in nav
     nav_manifest = next(line for line in opf.splitlines() if 'href="toc.xhtml"' in line)
     assert 'properties="nav"' in nav_manifest
+
+
+def test_spine_comment_survives_the_rebuild_instead_of_crashing_it(
+    tmp_path, monkeypatch
+):
+    """An XML comment inside <spine> must not become an itemref.
+
+    ebooklib's _load_spine turns every child of <spine> into an
+    (idref, linear) tuple, comments included — they come back as
+    (None, None), and writing that book dies inside lxml with "Argument
+    must be bytes or unicode, got 'NoneType'".
+    vertically-scrollable-manga.epub keeps a commented-out
+    page-progression-direction exactly there.
+    """
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "book.epub"
+    _write_epub(source, [("chapter.xhtml", ["Chapter body"])])
+    with zipfile.ZipFile(source) as archive:
+        opf = archive.read("EPUB/content.opf").decode("utf-8")
+    assert "<spine" in opf
+    head, _, tail = opf.partition("<spine")
+    tag, _, rest = tail.partition(">")
+    _replace_epub_member(
+        source,
+        "EPUB/content.opf",
+        f'{head}<spine{tag}><!-- page-progression-direction="rtl" -->{rest}',
+    )
+
+    loader = EPUBBookLoader(
+        str(source),
+        RecordingModel,
+        key="",
+        resume=False,
+        language="zh-hans",
+    )
+    # Pin the trigger: if ebooklib stops parsing the comment into the spine,
+    # this fails and the filter below is dead code to remove.
+    assert (None, None) in loader.origin_book.spine
+
+    rebuilt = loader._make_new_book(loader.origin_book)
+    assert (None, None) not in rebuilt.spine
+    assert len(rebuilt.spine) == len(loader.origin_book.spine) - 1
+    assert all(entry[0] for entry in rebuilt.spine)
+
+    epub.write_epub(str(tmp_path / "rebuilt.epub"), rebuilt)
 
 
 def test_empty_nav_is_generated_with_rebuilt_book_title(tmp_path, monkeypatch):
@@ -300,7 +346,7 @@ def test_epub_sequential_honors_excluded_files(tmp_path, monkeypatch):
 
 
 def test_epub_sequential_honors_only_filelist(tmp_path, monkeypatch):
-    loader, _ = _make_loader(
+    loader, output = _make_loader(
         tmp_path,
         monkeypatch,
         [("keep.xhtml", ["translate me"]), ("skip.xhtml", ["do not translate"])],
@@ -310,6 +356,38 @@ def test_epub_sequential_honors_only_filelist(tmp_path, monkeypatch):
     loader.make_bilingual_book()
 
     assert loader.translate_model.calls == ["translate me"]
+    # --only_filelist narrows the *work*, not the book. Dropping the other
+    # documents leaves the copied spine, the nav and the NCX pointing at
+    # files the package no longer contains (epubcheck RSC-007).
+    documents = _document_texts(output)
+    assert set(documents) >= {"keep.xhtml", "skip.xhtml"}
+    assert "do not translate" in documents["skip.xhtml"]
+    assert "&lt;T&gt;do not translate&lt;/T&gt;" not in documents["skip.xhtml"]
+
+
+def test_epub_parallel_only_filelist_keeps_the_untranslated_documents(
+    tmp_path, monkeypatch
+):
+    # same invariant on the parallel path, which assembles the output book
+    # from a different list
+    loader, output = _make_loader(
+        tmp_path,
+        monkeypatch,
+        [
+            ("keep.xhtml", ["translate me"]),
+            ("skip.xhtml", ["do not translate"]),
+            ("also.xhtml", ["nor this"]),
+        ],
+        parallel_workers=4,
+    )
+    loader.only_filelist = "keep.xhtml"
+
+    loader.make_bilingual_book()
+
+    assert loader.translate_model.calls == ["translate me"]
+    documents = _document_texts(output)
+    assert set(documents) >= {"keep.xhtml", "skip.xhtml", "also.xhtml"}
+    assert "nor this" in documents["also.xhtml"]
 
 
 def test_epub_sequential_test_num_limits_requests(tmp_path, monkeypatch):
@@ -425,7 +503,8 @@ def test_epub_sequential_interrupt_and_resume_uses_completed_prefix(
 
     with pytest.raises(SystemExit) as exc:
         loader.make_bilingual_book()
-    assert exc.value.code == 0
+    # an interrupted run has no finished book, and says so (P9)
+    assert exc.value.code == 130
     assert loader.p_to_save == ["<T>one</T>"]
 
     resumed, output = _make_loader(
@@ -572,7 +651,7 @@ def test_epub_parallel_interrupt_resumes_from_contiguous_prefix(tmp_path, monkey
 
     with pytest.raises(SystemExit) as exc:
         loader.make_bilingual_book()
-    assert exc.value.code == 0
+    assert exc.value.code == 130
     assert loader.p_to_save == ["<T>chapter A</T>"]
 
     resumed, output = _make_loader(
@@ -682,6 +761,75 @@ def test_epub_parallel_honors_block_size(tmp_path, monkeypatch):
     assert sorted(loader.translate_model.calls) == ["four", "one", "three", "two"]
 
 
+# --------------------------------------------- EPUB validity of the output
+# Three defects the 45-book corpus gate caught with epubcheck. Pinned here
+# too: the corpus gate is slow and opt-in, and these are cheap to check.
+
+
+def _bilingual_soup(html, **loader_kwargs):
+    from bs4 import BeautifulSoup as bs
+
+    from book_maker.loader.epub_loader import EPUBBookLoader
+    from book_maker.loader.helper import EPUBBookLoaderHelper
+    from book_maker.loader.plan import DisplayResolver, partition_soup
+
+    soup = bs(html, "html.parser")
+    fp = partition_soup(soup, DisplayResolver([]), "x.xhtml")
+    loader = EPUBBookLoader.__new__(EPUBBookLoader)
+    loader.translate_model = type(
+        "M", (), {"TRANSLATION_ERROR_MARKER": None, "_fatal_error_detected": False}
+    )()
+    loader.exclude_translate_tags = "sup,code"
+    loader.helper = EPUBBookLoaderHelper(loader.translate_model, 1, "", False)
+    for unit in fp.units:
+        loader._insert_plan_translation(unit, f"T[{unit.text}]", "", False)
+    return soup
+
+
+def test_bilingual_copy_does_not_duplicate_ids():
+    # epubcheck RSC-005: two elements answering to one fragment identifier,
+    # and an internal link that may land on the translation instead of the
+    # passage it cites
+    soup = _bilingual_soup(
+        '<html><body><p id="p1">Hello <span id="s1">world</span></p></body></html>'
+    )
+    for attr in ("p1", "s1"):
+        assert len(soup.find_all(id=attr)) == 1, f"duplicate id {attr}"
+    assert "T[Hello world]" in soup.get_text()
+
+
+def test_nav_translations_go_inside_their_element():
+    # an EPUB 3 nav document allows one heading before its <ol> and nothing
+    # but <a>/<span> inside an <li>; a translated sibling is invalid there
+    soup = _bilingual_soup(
+        "<html><body><nav epub:type='toc'><h2>Contents</h2>"
+        "<ol><li><a href='c1.xhtml'>Chapter 1</a></li></ol></nav></body></html>"
+    )
+    nav = soup.find("nav")
+    assert len(nav.find_all("h2")) == 1, "a second heading breaks nav grammar"
+    assert len(nav.find_all("li")) == 1
+    assert nav.find("li").find_all(True, recursive=False) == nav.find("li").find_all(
+        ["a", "span"], recursive=False
+    )
+    assert "T[Contents]" in nav.h2.get_text()
+    assert "T[Chapter 1]" in nav.find("a").get_text()
+
+
+def test_figcaption_translation_stays_inside_the_caption():
+    # <figure> accepts exactly one <figcaption>
+    soup = _bilingual_soup(
+        "<html><body><figure><img src='x.png'/>"
+        "<figcaption>A tree</figcaption></figure></body></html>"
+    )
+    assert len(soup.find_all("figcaption")) == 1
+    assert "T[A tree]" in soup.find("figcaption").get_text()
+
+
+# The NCX-item and OPF-<link> defects this file used to pin are covered by
+# test_epub_output_validity.py, whose `_rebuilder` gives `_make_new_book` the
+# source book, language and mode its derived identity now needs.
+
+
 def test_a_failed_final_write_exits_nonzero(tmp_path, monkeypatch):
     """A run whose output cannot be written has failed; exiting 0 tells
     every caller the opposite, with no artifact to contradict it."""
@@ -702,3 +850,57 @@ def test_a_failed_final_write_exits_nonzero(tmp_path, monkeypatch):
     assert writes, "the failure must come from the final write, not earlier"
     assert excinfo.value.code == 1
     assert not output.exists()
+
+
+def test_the_bar_shows_usage_once_a_request_reported_it():
+    # the meter replaces the old "no cached token after 10 requests" guard:
+    # the operator watches cached= on the bar instead of being warned
+    from book_maker.loader.epub_loader import EPUBBookLoader
+
+    loader = EPUBBookLoader.__new__(EPUBBookLoader)
+
+    class Bar:
+        postfix = None
+
+        def set_postfix(self, postfix, refresh=True):
+            self.postfix = postfix
+
+    class Silent:
+        pass
+
+    loader.translate_model = Silent()  # a translator without a meter
+    bar = Bar()
+    loader._show_usage(bar)
+    assert bar.postfix is None and loader._usage_suffix() == ""
+
+    class Metered:
+        def usage_postfix(self):
+            return {"in": "2.0k", "out": "400", "cached": "1.0k"}
+
+    loader.translate_model = Metered()
+    loader._show_usage(bar)
+    assert bar.postfix == {"in": "2.0k", "out": "400", "cached": "1.0k"}
+    assert loader._usage_suffix() == " in=2.0k out=400 cached=1.0k"
+
+
+def test_a_broken_meter_never_stops_the_bar():
+    """The bar hooks decorate; a meter that raises must not end a paid run."""
+    from book_maker.loader.epub_loader import EPUBBookLoader
+
+    loader = EPUBBookLoader.__new__(EPUBBookLoader)
+
+    class Broken:
+        def usage_postfix(self):
+            raise RuntimeError("meter")
+
+        def usage_summary(self):
+            raise RuntimeError("meter")
+
+    class Bar:
+        def set_postfix(self, postfix, refresh=True):
+            raise RuntimeError("bar")
+
+    loader.translate_model = Broken()
+    loader._show_usage(Bar())
+    assert loader._usage_suffix() == ""
+    loader._print_usage()

@@ -572,6 +572,33 @@ def test_batch_length_mismatch_is_retried_then_falls_back_one_by_one():
     assert translator._structured_support["test-model"] == "strict"
 
 
+def test_batch_empty_slot_for_nonempty_input_is_retried_then_falls_back():
+    # Count is not alignment: a model that merges two verse lines into one
+    # slot keeps the count by padding another slot with "". The strict path
+    # must treat that pad as the model error it is, not accept the window.
+    parse = Mock(return_value=_parsed_completion(parsed=_batch(["5a+5b merged", ""])))
+    translator = _translator(parse=parse)
+    translator._structured_support["test-model"] = "strict"
+    translator.translate = Mock(side_effect=lambda text, _=True: f"t:{text}")
+
+    result = translator._do_structured_batch_translate(["5a", "5b"])
+
+    assert result == ["t:5a", "t:5b"]
+    assert parse.call_count == 3  # a model error, not a capability answer
+    assert translator._structured_support["test-model"] == "strict"
+
+
+def test_batch_empty_output_for_empty_input_is_accepted():
+    # the complement: only *non-empty* inputs may not come back empty —
+    # an empty slot mirroring an empty input is well-formed output
+    parse = Mock(return_value=_parsed_completion(parsed=_batch(["一", ""])))
+    translator = _translator(parse=parse)
+    translator._structured_support["test-model"] = "strict"
+
+    assert translator._do_structured_batch_translate(["a", "  "]) == ["一", ""]
+    assert parse.call_count == 1
+
+
 def test_batch_success_returns_paragraphs():
     parse = Mock(return_value=_parsed_completion(parsed=_batch(["一", "二"])))
     translator = _translator(parse=parse)
@@ -1196,3 +1223,139 @@ def test_a_strict_endpoint_that_answers_prose_falls_through():
 )
 def test_json_extraction_survives_fences_and_prose(reply, expected):
     assert ChatGPTAPI._extract_json_object(reply) == expected
+
+
+def _model_list_translator(api_models):
+    """A translator whose only live surface is the endpoint's model listing."""
+    translator = _translator()
+    translator.deployment_id = None
+    translator._fetch_api_models_with_retry = Mock(return_value=api_models)
+    return translator
+
+
+def test_model_list_keeps_the_order_it_was_given():
+    # --model_list a,b names a first on purpose: the first id is what the
+    # structured-output probe grades and what the compact budget keys on.
+    # Deduplicating through a set made that a coin flip between runs.
+    translator = _model_list_translator(["b-model", "a-model", "c-model"])
+
+    translator.set_model_list(["a-model", "b-model", "a-model"])
+
+    assert translator._model_names == ["a-model", "b-model"]
+    assert translator.model == "a-model"
+
+
+def test_model_list_order_survives_an_endpoint_missing_one_model():
+    # the surviving ids keep the user's order, not the endpoint's listing order
+    translator = _model_list_translator(["c-model", "b-model", "a-model"])
+
+    translator.set_model_list(["a-model", "gone", "b-model"])
+
+    assert translator._model_names == ["a-model", "b-model"]
+    assert translator.model == "a-model"
+
+
+def test_gateways_know_their_model_before_the_first_request():
+    # Codex review 2 on #553: `preflight` sizes an auto compact budget from
+    # every model in play before any request rotates one in; the gateways
+    # used to leave `model` None and `_model_names` empty until then
+    from book_maker.translator.orcarouter_translator import OrcaRouterTranslator
+    from book_maker.translator.xai_translator import XAIClient
+
+    orca = OrcaRouterTranslator("sk-orca-test", "Chinese")
+    assert orca.model == "orcarouter/auto"
+    assert orca._model_names == ("orcarouter/auto",)
+    xai = XAIClient("sk-xai-test", "Chinese")
+    assert xai.model == "grok-beta"
+    assert xai._model_names == ("grok-beta",)
+
+
+# --------------------------------------------------------------------------
+# Usage meter: in/out/cached on the progress bar, replacing the cache guard
+# --------------------------------------------------------------------------
+
+
+def test_the_meter_sums_what_each_request_billed():
+    from types import SimpleNamespace
+    from book_maker.translator.chatgptapi_translator import ChatGPTAPI
+
+    t = ChatGPTAPI("k", "zh-hans")
+    assert t.usage_postfix() is None  # nothing reported yet: nothing shown
+    t._note_usage(
+        SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=1200,
+                completion_tokens=300,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=1000),
+            )
+        )
+    )
+    t._note_usage(
+        SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=800, completion_tokens=100, prompt_tokens_details=None
+            )
+        )
+    )
+    t._note_usage(SimpleNamespace(usage=None))  # an answer without usage
+    t._note_usage(None)  # a truncated answer that carried no completion
+    assert t.usage_postfix() == {"in": "2.0k", "out": "400", "cached": "1.0k"}
+    assert t.usage_summary() == "tokens: in 2.0k, out 400, cached 1.0k (2 requests)"
+
+
+def test_short_counts_fit_a_progress_bar():
+    from book_maker.translator.base_translator import short_count
+
+    assert short_count(0) == "0"
+    assert short_count(999) == "999"
+    assert short_count(12345) == "12.3k"
+    assert short_count(1_234_567) == "1.23M"
+
+
+def test_the_claude_meter_counts_cache_reads_inside_the_prompt_total():
+    from types import SimpleNamespace
+    from book_maker.translator.claude_translator import Claude
+
+    t = Claude("k", "zh-hans")
+    t._note_usage(
+        SimpleNamespace(
+            usage=SimpleNamespace(
+                input_tokens=100,
+                output_tokens=50,
+                cache_read_input_tokens=900,
+                cache_creation_input_tokens=0,
+            )
+        )
+    )
+    assert t.usage_postfix() == {"in": "1.0k", "out": "50", "cached": "900"}
+
+
+def test_an_odd_usage_record_never_stops_a_request():
+    """The meter is a readout, not a gate: a gateway that reports tokens as
+    strings, as None, or through an object whose attributes raise must cost
+    the operator the number on the bar and nothing else."""
+    from types import SimpleNamespace
+    from book_maker.translator.base_translator import UsageMeter
+    from book_maker.translator.chatgptapi_translator import ChatGPTAPI
+    from book_maker.translator.claude_translator import Claude
+
+    meter = UsageMeter()
+    meter.note("12", None, object())  # strings and junk are not summed, not fatal
+    meter.note(3.0, 2, 1)
+    assert (meter.prompt, meter.completion, meter.cached, meter.requests) == (
+        15,
+        2,
+        1,
+        2,
+    )
+
+    class Exploding:
+        @property
+        def usage(self):
+            raise RuntimeError("gateway shaped this one strangely")
+
+    for t in (ChatGPTAPI("k", "zh-hans"), Claude("k", "zh-hans")):
+        t._note_usage(Exploding())
+        assert t.usage_postfix() is None
+        t._note_usage(SimpleNamespace(usage={"prompt_tokens": 5}))  # a dict
+        assert t.usage_postfix() == {"in": "0", "out": "0", "cached": "0"}

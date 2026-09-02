@@ -1,4 +1,5 @@
 import builtins
+import difflib
 import hashlib
 import json
 import os
@@ -29,13 +30,18 @@ from book_maker.utils import num_tokens_from_text, prompt_config_to_kwargs
 
 from .base_loader import BaseBookLoader
 from .helper import (
+    language_tag,
+    stamp_translation,
+    restamp_language,
     EPUBBookLoaderHelper,
     append_inline_translation,
     backfill_toc_hrefs,
     derive_translation_identity,
     has_restricted_content_model,
     is_text_link,
+    make_tag,
     not_trans,
+    rebase_ncx_srcs,
     shorter_result_link,
     strip_duplicate_ids,
 )
@@ -43,16 +49,76 @@ from .plan import (
     PLAN_SCHEMA_VERSION,
     BookCss,
     TranslationPlan,
+    UnsafeSingleTranslateError,
+    file_segment_hazards,
     file_sha256,
+    inline_subtree_root,
     is_fixed_layout,
+    is_simple_owner,
     load_plan_overrides,
     partition_file,
+    planning_settings,
 )
 from .classify import (
     PlanClassifyError,
+    PlanUnresolvedError,
     build_agent_prompt,
     classify_plan,
-    gather_candidates,
+    decide_everything,
+    mode_policy,
+)
+
+# Every key-bearing CLI flag, and the environment variable it falls back to
+# when it is absent. The rerun line printed at a plan handoff is rebuilt from
+# argv, so a key typed on the command line would otherwise be echoed to the
+# terminal, written into whatever log the run is piped to, and pasted whole
+# into an agent session — three copies of a secret, on a run that spends
+# nothing and looks harmless. Naming the variable rather than masking with
+# `***` keeps the printed command runnable for anyone who exports it.
+KEY_FLAG_ENV = {
+    "--openai_key": "BBM_OPENAI_API_KEY",
+    "--caiyun_key": "BBM_CAIYUN_API_KEY",
+    "--deepl_key": "BBM_DEEPL_API_KEY",
+    "--claude_key": "BBM_CLAUDE_API_KEY",
+    "--gemini_key": "BBM_GOOGLE_GEMINI_KEY",
+    "--groq_key": "BBM_GROQ_API_KEY",
+    "--xai_key": "BBM_XAI_API_KEY",
+    "--orcarouter_key": "BBM_ORCAROUTER_API_KEY",
+    "--qwen_key": "BBM_QWEN_API_KEY",
+    # --api_key belongs to --provider, whose key variable is named by the
+    # provider entry rather than fixed here; the generic name is a variable
+    # the user exports, which is all the placeholder has to be.
+    "--api_key": "BBM_API_KEY",
+}
+
+
+def _key_flag_env(flag):
+    """The env var standing in for `flag`'s value, or None if it carries no key.
+
+    Exact spellings are not enough: argparse accepts any unambiguous
+    abbreviation of a long option, so `--openai_k sk-...` is a perfectly valid
+    invocation that an exact lookup would print back verbatim. Anything that
+    prefixes a key flag is therefore treated as that flag. A prefix matching
+    several of them is ambiguous and argparse would have rejected the command,
+    but it is still redacted — a secret must not reach the terminal on the
+    strength of an argument the parser refused.
+    """
+    env_name = KEY_FLAG_ENV.get(flag)
+    if env_name is not None:
+        return env_name
+    if not flag.startswith("--") or len(flag) < 3:
+        return None
+    matches = {env for f, env in KEY_FLAG_ENV.items() if f.startswith(flag)}
+    if len(matches) == 1:
+        return matches.pop()
+    return "BBM_API_KEY" if matches else None
+
+
+# Inline elements that mean something without holding text: a link target,
+# an image, a line break. Emptying a wrapper is a reason to delete it; these
+# were never wrappers.
+_KEEP_WHEN_EMPTY = frozenset(
+    ["img", "br", "hr", "svg", "input", "video", "audio", "object", "iframe"]
 )
 
 
@@ -85,10 +151,40 @@ class ChapterTranslationPlan:
     item: object
     soup: object
     jobs: list[TranslationJob]
-    include_in_output: bool = True
+
+
+def check_file_filters_against(book, only_filelist, exclude_filelist):
+    """Every name in --only_filelist / --exclude_filelist must be in `book`.
+
+    Shared by the loader and the plan dry run, which has no loader: the
+    answer needs the book and nothing else.
+    """
+    documents = sorted(item.file_name for item in book.get_items_of_type(ITEM_DOCUMENT))
+    known = set(documents)
+    for flag, raw in (
+        ("--only_filelist", only_filelist),
+        ("--exclude_filelist", exclude_filelist),
+    ):
+        unknown = [f for f in raw.split(",") if f and f not in known]
+        if not unknown:
+            continue
+        lines = [
+            f"[bold red]{flag} names {len(unknown)} document(s) this book "
+            f"does not have: {', '.join(unknown)}.[/bold red]"
+        ]
+        for name in unknown:
+            near = difflib.get_close_matches(name, documents, n=3, cutoff=0.5)
+            if near:
+                lines.append(f"  {name} — did you mean: {', '.join(near)}?")
+        lines.append(f"  the book's documents: {', '.join(documents)}")
+        print("\n".join(lines))
+        raise SystemExit(1)
 
 
 class EPUBBookLoader(BaseBookLoader):
+    # what `lang=` may carry for the target language; None stamps nothing
+    language_tag = None
+
     CHECKPOINT_VERSION = 3
     CHECKPOINT_ORDER = "document"
 
@@ -115,6 +211,8 @@ class EPUBBookLoader(BaseBookLoader):
     ):
         self.epub_name = epub_name
         self.language = language
+        # what `lang=` may carry for that language, or None when nothing may
+        self.language_tag = language_tag(language)
         self.new_epub = epub.EpubBook()
         self.translate_model = model(
             key,
@@ -143,6 +241,7 @@ class EPUBBookLoader(BaseBookLoader):
             self.accumulated_num,
             self.translation_style,
             self.context_flag,
+            language=self.language,
         )
         self.retranslate = None
         self.exclude_filelist = ""
@@ -156,7 +255,11 @@ class EPUBBookLoader(BaseBookLoader):
         self.plan_mode = False
         self.plan_min_coverage = 0.5
         self.poetry_group_size = 8
-        self.plan_classify = "none"  # none | model | agent, see .classify
+        # "none" = no plan mode, the CLI's default. A caller that turns plan
+        # mode on must pick all | model | agent (see .classify): there is no
+        # mode where nobody decides and the code translates whatever it could
+        # not rule out, so "none" inside plan mode is refused, not defaulted.
+        self.plan_classify = "none"
         self.plan_classify_model = None  # user-chosen classifier; failure blocks
         self._plan_css = None
         self._plan_overrides = None
@@ -182,7 +285,8 @@ class EPUBBookLoader(BaseBookLoader):
             for item in obj.book.get_items():
                 if isinstance(item, epub.EpubNcx):
                     obj.out.writestr(
-                        "%s/%s" % (obj.book.FOLDER_NAME, item.file_name), obj._get_ncx()
+                        "%s/%s" % (obj.book.FOLDER_NAME, item.file_name),
+                        rebase_ncx_srcs(obj._get_ncx(), item.file_name),
                     )
                 elif isinstance(item, epub.EpubNav):
                     # ebooklib regenerates every EpubNav from book.toc by
@@ -228,6 +332,16 @@ class EPUBBookLoader(BaseBookLoader):
         self.bin_path = f"{Path(epub_name).parent}/.{Path(epub_name).stem}.temp.bin"
         if self.resume:
             self.load_state()
+        elif os.path.exists(self.bin_path):
+            # Overwriting is the documented behaviour; doing it silently is
+            # not. A run that meant to continue has one flag to add. Worded
+            # as a prospect: a plan gate or a filter typo may still end the
+            # run before the first save touches the file.
+            print(
+                f"[yellow]existing progress cache {self.bin_path} is ignored "
+                f"and will be overwritten once translation starts; pass "
+                f"--resume to continue it instead[/yellow]"
+            )
 
     @staticmethod
     def _is_special_text(text):
@@ -319,7 +433,18 @@ class EPUBBookLoader(BaseBookLoader):
                 else:
                     new_book.add_metadata(namespace, name, value)
 
-        new_book.spine = book.spine
+        # ebooklib's _load_spine turns every child of <spine> into an
+        # (idref, linear) tuple — including XML comments, which become
+        # (None, None) and crash lxml at write time with "Argument must be
+        # bytes or unicode" (vertically-scrollable-manga.epub keeps a
+        # commented-out page-progression-direction inside its spine). An
+        # entry with no idref references nothing, so dropping it loses
+        # neither content nor reading order.
+        new_book.spine = [
+            entry
+            for entry in book.spine
+            if not (isinstance(entry, tuple) and not entry[0])
+        ]
         new_book.toc = backfill_toc_hrefs(self._fix_toc_uids(book.toc))
         return new_book
 
@@ -438,11 +563,33 @@ class EPUBBookLoader(BaseBookLoader):
         name, _ = os.path.splitext(self.epub_name)
         plan_path = f"{name}_plan.json"
         # agent mode hands the plan over on the run that creates it, and
-        # translates on the run that finds one already there
+        # translates on the run that finds one already there. What each mode
+        # does with the file is one table in classify/, not a condition
+        # repeated at every branch that happens to care.
+        policy = mode_policy(self.plan_classify)
         plan_existed = os.path.exists(plan_path)
+        if plan_existed and not policy.reads_saved_plan:
+            print(
+                f"note: --plan-classify {policy.name} ignores the existing plan "
+                f"{plan_path}; it translates the whole partition"
+            )
+            plan_existed = False
         overrides = None
+        saved_ledger = None
         if plan_existed:
-            overrides = load_plan_overrides(plan_path, self.epub_name)
+            only = {f for f in self.only_filelist.split(",") if f}
+            exclude = {f for f in self.exclude_filelist.split(",") if f}
+            expected_settings = planning_settings(
+                self._exclude_tags_tuple(),
+                self.poetry_group_size,
+                only,
+                exclude,
+            )
+            saved_ledger, overrides = load_plan_overrides(
+                plan_path,
+                self.epub_name,
+                expected_settings=expected_settings,
+            )
             if overrides:
                 print(
                     f"Applying {len(overrides)} signature override(s) from {plan_path}"
@@ -470,26 +617,69 @@ class EPUBBookLoader(BaseBookLoader):
             )
             raise SystemExit(1)
 
-        # LLM classification runs exactly once, on the run that creates the
-        # plan JSON: from then on the JSON is the source of truth (user edits
-        # win, resume fingerprints stay stable). Delete it to reclassify.
-        llm_actions = {}
-        if not os.path.exists(plan_path):
-            llm_actions = self._classify_plan(plan)
-            if llm_actions:
-                # the JSON is written from the pre-verdict plan: demoted
-                # signatures still have rows to carry their action
-                plan.save_json(
-                    plan_path, book_path=self.epub_name, llm_actions=llm_actions
-                )
-                print(
-                    f"plan written to {plan_path} with {len(llm_actions)} "
-                    f"llm-decided action(s) (edit signature actions to override)"
-                )
-                overrides = {**(overrides or {}), **llm_actions}
+        # Before anything is paid for: a unit whose translation cannot be
+        # written back where it belongs must not be translated at all.
+        self._guard_unsafe_units(plan)
+
+        # The ledger carries every question this book asks, plus whatever a
+        # previous run already answered.
+        ledger = plan.build_ledger(decisions=saved_ledger, overrides=overrides)
+        plan_written = False
+        # A plan answers the questions the book asked when it was written.
+        # Change the file filters or the excluded tags and the book asks
+        # different ones — and a question with no row in the file cannot be
+        # answered, so the demand to decide it can never be satisfied.
+        added, dropped = set(), set()
+        if saved_ledger is not None:
+            added = set(ledger.rows) - set(saved_ledger.rows)
+            dropped = set(saved_ledger.rows) - set(ledger.rows)
+        reopened = set(ledger.reopened_keys)
+        if policy.name == "all":
+            # "all" answers every question the same way, on purpose and out
+            # loud — see classify/all.py for why that is not a default.
+            decide_everything(ledger)
+            plan.record_dispositions(ledger)
+
+        # LLM classification is owed to whatever is still a question — on the
+        # run that creates the plan JSON, and equally on a run that finds one
+        # drafted by --plan-dry-run or left half-answered by an earlier
+        # failure. Rows already decided are never re-asked, so the JSON stays
+        # the source of truth (user edits win, resume fingerprints stay
+        # stable). Delete it to reclassify from scratch.
+        if self.plan_classify == "model" and ledger.undecided_keys():
+            decisions = self._classify_plan(ledger, plan, plan_path)
+            for key, (verdict, content_type) in decisions.items():
+                ledger.decide(key, verdict, "llm", content_type)
+            skips = ledger.skip_keys()
+            print(
+                f"llm classification: {len(decisions)} verdict(s), "
+                f"{len(skips)} skip(s)"
+            )
+            if skips:
+                overrides = {
+                    **(overrides or {}),
+                    **{k: ("skip", by) for k, by in skips.items()},
+                }
                 self._plan_overrides = overrides
                 self._plan_partitions.clear()
                 plan = self._build_partitioned_plan()
+                # This plan, not the pre-classification one, is what gets
+                # written back to the book. A skipped inline signature
+                # changes the segmentation around it, so a run that cannot
+                # be placed can exist only here — guard the plan that ships.
+                self._guard_unsafe_units(plan)
+            # Unconditionally: `decide()` sets the verdict, never the
+            # disposition, and the only other call happened while every row
+            # was still a question. A run whose model skipped nothing used to
+            # save a plan claiming a decision on every row and an outcome on
+            # none of them.
+            plan.record_dispositions(ledger)
+            plan.save_json(plan_path, book_path=self.epub_name, ledger=ledger)
+            print(
+                f"plan written to {plan_path} (override a verdict by editing its "
+                f'"action", "decided_by" and "content_type")'
+            )
+            plan_written = True
 
         # Anything that changes the unit list (and therefore the positional
         # meaning of resume-cache slots) is part of the fingerprint; a cache
@@ -538,30 +728,64 @@ class EPUBBookLoader(BaseBookLoader):
             raise SystemExit(1)
 
         # samples are book text: rich would eat "[Seven] warriors [they were]"
-        print(escape(plan.report()))
-        if os.path.exists(plan_path) and not llm_actions:
-            # never overwrite: the file may carry user-edited signature
-            # actions (and load_plan_overrides already verified its hash)
+        print(escape(plan.report(ledger)))
+        if plan_written or not policy.writes_plan_file:
+            # already written above with its own message, or ("all") a mode
+            # that asks nothing and therefore writes no plan file
+            pass
+        elif not plan_existed:
+            plan.save_json(plan_path, book_path=self.epub_name, ledger=ledger)
+            undecided = ledger.undecided_keys()
+            print(
+                f"plan written to {plan_path} with {len(undecided)} "
+                f"undecided signature(s) (null actions must be resolved)"
+            )
+        elif added or reopened or ledger.settings_changed:
+            # `dropped` alone is deliberately not a trigger: a row can vanish
+            # without the settings moving only because *this run's own* skip
+            # overrides re-shaped the partition, and rewriting then deletes
+            # decisions the user would need again the moment the skip is
+            # reverted. A settings change that drops rows still rewrites,
+            # through `settings_changed`.
+            plan.save_json(plan_path, book_path=self.epub_name, ledger=ledger)
+            changes = []
+            if added:
+                changes.append(f"{len(added)} added")
+            if dropped:
+                changes.append(f"{len(dropped)} dropped")
+            if reopened:
+                reason = (
+                    "planning settings changed"
+                    if ledger.settings_changed
+                    else "occurrence evidence changed"
+                )
+                changes.append(f"{len(reopened)} decision(s) reopened ({reason})")
+            elif ledger.settings_changed:
+                changes.append("planning settings refreshed")
+            print(f"{plan_path} updated: {', '.join(changes)}")
+            if dropped:
+                print(
+                    f"[bold yellow]{len(dropped)} decided signature(s) no "
+                    f"longer occur under these settings and were dropped from "
+                    f"{plan_path}: {', '.join(sorted(dropped)[:5])}. Restoring "
+                    f"the previous settings means deciding them again."
+                    f"[/bold yellow]"
+                )
+        else:
+            if dropped:
+                # kept in the file, not dropped from it: the rows are still
+                # there with their verdicts, and reverting the skip that
+                # re-shaped the partition brings their signatures back.
+                print(
+                    f"[bold yellow]{len(dropped)} decided signature(s) do not "
+                    f"occur in this run's partition and were left untouched in "
+                    f"{plan_path}: {', '.join(sorted(dropped)[:5])}."
+                    f"[/bold yellow]"
+                )
+            # never overwrite for its own sake: the file may carry
+            # user-edited decisions (and load_plan_overrides already verified
+            # its hash)
             print(f"using existing plan {plan_path}")
-        elif not llm_actions:
-            pending = None
-            if self.plan_classify == "agent":
-                # uncertain signatures go out with action null: an open
-                # question, not a translate default. A rerun that answers
-                # none of them is refused by load_plan_overrides — the
-                # greedy all-translate shortcut must not be reachable by
-                # simply rerunning the command.
-                pending = [c["signature"] for c in gather_candidates(plan)]
-            plan.save_json(plan_path, book_path=self.epub_name, pending=pending)
-            if pending:
-                print(
-                    f"plan written to {plan_path} with {len(pending)} "
-                    f"undecided signature(s) (null actions must be resolved)"
-                )
-            else:
-                print(
-                    f"plan written to {plan_path} (edit signature actions to override)"
-                )
 
         if plan.coverage < self.plan_min_coverage:
             print(
@@ -572,17 +796,62 @@ class EPUBBookLoader(BaseBookLoader):
             )
             raise SystemExit(1)
 
-        if self.plan_classify == "agent" and not plan_existed:
-            # Stop here: translating now would spend the whole book before
-            # anyone looked at the questions the plan is asking. A rerun
-            # finds the (possibly edited) plan and goes straight through.
+        undecided = ledger.undecided_keys()
+        if undecided:
+            # Stop: translating now would spend the whole book on questions
+            # nobody answered, and the greedy all-translate shortcut must not
+            # be reachable by simply rerunning the command. A rerun finds the
+            # (edited) plan and goes straight through.
+            # The exit code separates this stop from that rerun's success —
+            # agent mode reaches both from one command line, so a caller that
+            # only saw 0 could not tell a handed-off book from a translated
+            # one. See PLAN_HANDOFF_EXIT_CODE.
             # builtins.print, not rich: this block is meant to be copied, and
             # rich would hard-wrap the paths and the rerun command mid-token.
             builtins.print(
-                build_agent_prompt(plan_path, self.epub_name, self._rerun_command())
+                build_agent_prompt(
+                    plan_path,
+                    self.epub_name,
+                    self._rerun_command(),
+                    unresolved=undecided,
+                )
             )
-            raise SystemExit(0)
+            raise SystemExit(policy.handoff_exit_code)
+        # The last gate before money is spent: nothing undecided, and no
+        # decision without a decider and a named content type. It repeats
+        # what `decide` and `Ledger.load` already enforce on purpose —
+        # reaching it in an illegal state means something wrote the ledger
+        # without going through either.
+        ledger.require_decided(plan_path)
         return plan
+
+    def _guard_unsafe_units(self, plan):
+        """Refuse units whose translation cannot be written back in place.
+
+        Anchored runs make this an invariant check rather than a policy:
+        a run that reports a hazard is a segmentation bug, not a book we
+        should refuse. Failing loudly here beats writing a document whose
+        text has moved, and beats a silent `assert` nobody reads.
+        """
+        offenders = []
+        for fp in plan.files:
+            for unit, hazards in file_segment_hazards(fp):
+                offenders.append((fp.file_name, unit, hazards))
+        if not offenders:
+            return
+        listed = "\n".join(
+            f"  {file_name} / {unit.signature} / {','.join(hazards)} / "
+            f"{escape(unit.text[:60])}"
+            for file_name, unit, hazards in offenders[:20]
+        )
+        raise UnsafeSingleTranslateError(
+            f"{len(offenders)} run(s) span content that renders between "
+            f"their parts, so no single position in the document holds "
+            f"them:\n{listed}\n"
+            f"This is a partitioning defect, not a problem with the book — "
+            f"please report it with the file and signature above. Tag mode "
+            f"(--translate-tags) does not use the partition and will run."
+        )
 
     @staticmethod
     def _rerun_command():
@@ -590,10 +859,48 @@ class EPUBBookLoader(BaseBookLoader):
 
         Reconstructed from argv so the printed instructions name the user's
         actual invocation (their book, their model, their language) — a
-        generic example would have to be translated back by hand.
+        generic example would have to be translated back by hand. Keys are
+        the one thing not reproduced verbatim: see KEY_FLAG_ENV.
         """
-        parts = [shlex.quote(a) for a in sys.argv]
+        parts = []
+        # Set once a bare key flag is seen, so the value that follows it in
+        # the next argv entry is replaced instead of quoted.
+        pending_env = None
+        for arg in sys.argv:
+            if pending_env is not None:
+                parts.append(f'"${pending_env}"')
+                pending_env = None
+                continue
+            flag, joined, _value = arg.partition("=")
+            env_name = _key_flag_env(flag)
+            if env_name is None:
+                parts.append(shlex.quote(arg))
+            elif joined:
+                # `--openai_key=sk-…`: the key never becomes its own entry
+                parts.append(f'{flag}="${env_name}"')
+            else:
+                parts.append(shlex.quote(arg))
+                pending_env = env_name
         return " ".join(["python3", *parts])
+
+    def check_file_filters(self):
+        """Every name in --only_filelist / --exclude_filelist must exist.
+
+        A misspelled only-list name reached the coverage gate as "the plan
+        selected no translatable text"; a misspelled exclude-list name
+        reached nothing at all — the document the user meant to skip was
+        translated and paid for, with no warning. Both are typos, and both
+        are cheap to catch.
+
+        Called by the CLI as soon as the filters are set, which is before
+        any model setup: the answer needs the book and nothing else, so
+        there is no reason for a sidecar or a window lookup to happen first.
+        Tag mode needs it as much as plan mode — it was the only mode that
+        never ran it.
+        """
+        check_file_filters_against(
+            self.origin_book, self.only_filelist, self.exclude_filelist
+        )
 
     def _build_partitioned_plan(self):
         """The plan is built from the same cached partitions the processing
@@ -613,52 +920,85 @@ class EPUBBookLoader(BaseBookLoader):
                 continue
             files.append(self._plan_partition(item)[1])
         return TranslationPlan(
-            files, self._exclude_tags_tuple(), self.poetry_group_size
+            files,
+            self._exclude_tags_tuple(),
+            self.poetry_group_size,
+            only_files=only,
+            exclude_files=exclude,
         )
 
-    def _classify_plan(self, plan):
-        """LLM verdicts for the plan's uncertain signatures; {} when disabled
-        or unavailable.
+    def _classify_plan(self, ledger, plan, plan_path):
+        """LLM verdicts for every undecided row.
 
-        A classifier model the user chose explicitly must work — a failure
-        stops the run. The default (the translating model) degrades to a
-        printed notice: the heuristics already made a safe plan.
+        There is no degrade-to-defaults path. A classification that cannot
+        finish leaves questions unanswered, and answering them with the
+        greedy default is the exact silent decision this mode exists to
+        remove — so whatever *was* decided is written down and the run
+        stops with the same instructions agent mode prints.
         """
-        if self.plan_classify != "model":
-            return {}
         try:
-            actions, candidates = classify_plan(
-                plan,
+            decisions, _candidates = classify_plan(
+                ledger,
                 self.translate_model,
-                overrides=self._plan_overrides,
                 model=self.plan_classify_model,
             )
-        except PlanClassifyError as e:
-            if self.plan_classify_model:
-                print(
-                    f"[bold red]--plan-classify-model "
-                    f"{self.plan_classify_model}: {e}[/bold red]"
+        except PlanUnresolvedError as e:
+            for key, (verdict, content_type) in e.resolved.items():
+                ledger.decide(key, verdict, "llm", content_type)
+            # An "unsure" row stays a question, but the model still named
+            # what it was looking at. Keeping the name means the agent
+            # answering these rows starts from that evidence instead of
+            # re-deriving it, and nothing paid for is thrown away.
+            named = sum(
+                ledger.note_content_type(key, content_type) is not None
+                for key, content_type in e.considered.items()
+            )
+            plan.record_dispositions(ledger)
+            plan.save_json(plan_path, book_path=self.epub_name, ledger=ledger)
+            print(
+                f"[bold red]{e}[/bold red]\n"
+                f"[yellow]{len(e.resolved)} decided verdict(s) were saved to "
+                f"{plan_path}"
+                + (f", plus {named} named-but-undecided row(s)" if named else "")
+                + f"; the undecided rows are listed below.[/yellow]"
+            )
+            builtins.print(
+                build_agent_prompt(
+                    plan_path,
+                    self.epub_name,
+                    self._rerun_command(),
+                    unresolved=e.unresolved,
                 )
-                raise SystemExit(1)
+            )
+            raise SystemExit(1)
+        except PlanClassifyError as e:
+            # No verdicts at all: auth, quota, a model that cannot answer.
+            # Nothing that justifies translating — but earlier pages may have
+            # *named* rows before the failure, and those names are paid-for
+            # evidence. Save them (as questions, not decisions) so a rerun or
+            # an agent does not buy the same look twice.
+            named = sum(
+                ledger.note_content_type(key, content_type) is not None
+                for key, content_type in getattr(e, "considered", {}).items()
+            )
+            if named:
+                plan.record_dispositions(ledger)
+                plan.save_json(plan_path, book_path=self.epub_name, ledger=ledger)
             print(
-                f"[yellow]plan classification skipped entirely ({e}); "
-                f"no signature was reviewed. Keeping the heuristic plan, "
-                f"which translates everything it cannot structurally rule "
-                f"out[/yellow]"
+                f"[bold red]plan classification failed: {e}[/bold red]\n"
+                + (
+                    f"[yellow]{named} row(s) were named before the failure and "
+                    f"saved to {plan_path} as open questions.[/yellow]\n"
+                    if named
+                    else ""
+                )
+                + f"[yellow]Nothing was decided, so nothing will be "
+                f"translated. Use --plan-classify agent to decide the rows "
+                f"yourself, or --plan-classify all to translate the whole "
+                f"partition deliberately.[/yellow]"
             )
-            return {}
-        if candidates and not actions:
-            print(
-                f"llm classification: {len(candidates)} uncertain "
-                f"signature(s) reviewed, plan unchanged"
-            )
-        elif actions:
-            decisions = ", ".join(
-                f"{sig} -> {'skip' if act == 'llm-skip' else 'translate'}"
-                for sig, act in actions.items()
-            )
-            print(f"llm classification: {escape(decisions)}")
-        return actions
+            raise SystemExit(1)
+        return decisions
 
     def _partition_item(self, soup, file_name):
         fp, _ = partition_file(
@@ -727,6 +1067,7 @@ class EPUBBookLoader(BaseBookLoader):
             )
             if pbar is not None:
                 pbar.update(n)
+                self._show_usage(pbar)
         return index
 
     def _insert_plan_translation(
@@ -748,45 +1089,225 @@ class EPUBBookLoader(BaseBookLoader):
             return
         if single_translate and unit.nodes:
             # Ruby annotations of text that is about to disappear would
-            # survive as orphaned furigana next to non-Japanese text — collect
-            # the <ruby> wrappers of owned nodes before replacing them.
-            rubies = []
+            # survive as orphaned furigana next to non-Japanese text. The
+            # wrapper goes with them, *before* the translation is written:
+            # EPUB's schema has no annotationless <ruby> — the element
+            # requires an rt/rtc after its base (RSC-005 "element ruby
+            # incomplete"), so both a <ruby></ruby> husk and a
+            # <ruby>translation</ruby> are files epubcheck rejects
+            # (1,897 findings on kusamakura between them). Attributes ride
+            # on into a <span>: an id here is a link target the book still
+            # needs, and unwrap() would drop it.
+            rubies = {}
             for node in unit.nodes:
                 for ancestor in node.parents:
                     if ancestor is unit.element:
                         break
                     if ancestor.name == "ruby":
-                        rubies.append(ancestor)
-            # <br> separated lines the unit merged into one text: once the
-            # later nodes are gone the breaks separate nothing and would
-            # render as blank lines under the translation.
-            owned = set(id(n) for n in unit.nodes)
-            stray_brs = [
-                br
-                for br in unit.element.find_all("br")
-                if any(
-                    id(sib) in owned
-                    for sib in br.next_siblings
-                    if isinstance(sib, NavigableString)
-                )
-                and any(
-                    id(sib) in owned
-                    for sib in br.previous_siblings
-                    if isinstance(sib, NavigableString)
-                )
-            ]
-            unit.nodes[0].replace_with(NavigableString(t_text))
-            for node in unit.nodes[1:]:
-                node.extract()
-            for br in stray_brs:
-                br.extract()
-            for ruby in rubies:
+                        rubies[id(ancestor)] = ancestor
+            for ruby in rubies.values():
                 for annotation in ruby.find_all(["rt", "rp", "rtc"]):
                     annotation.extract()
+                if ruby.attrs:
+                    ruby.name = "span"
+                else:
+                    ruby.unwrap()
+            self._write_single_translation(
+                unit, t_text, translation_style, language=self.language_tag
+            )
+        elif has_restricted_content_model(unit.element):
+            self._append_inline_translation(
+                unit, t_text, translation_style, language=self.language_tag
+            )
+        elif unit.resolver is not None and (
+            # A clone carries *all* of the owner's text, so it is only a
+            # translation of this unit when this unit is the whole owner.
+            # With several runs — <br>-separated verse, a retained skip
+            # between two halves — every run would clone the same source
+            # and insert it directly after it, which reverses the
+            # translations and detaches each from the run it belongs to.
+            unit.owner_runs > 1
+            or not is_simple_owner(unit.element, unit.resolver)
+        ):
+            self._insert_anchored_translation(
+                unit, t_text, translation_style, language=self.language_tag
+            )
         else:
             self._insert_trans_preserving_tags(
                 unit.element, t_text, translation_style, False
             )
+
+    @staticmethod
+    def _append_inline_translation(unit, t_text, translation_style="", language=None):
+        """Put the translation *inside* the element it belongs to.
+
+        Same rule as `helper.append_inline_translation` — the containers that
+        accept exactly one of a thing, where a translated sibling is a book
+        epubcheck rejects — but anchored to the *run* rather than the owner.
+        A plan unit knows which text nodes it owns, so the translation goes
+        directly after the last of them: inside the <a> of a navigation
+        entry, where that entry's text already lives. The helper appends to
+        the element because tag mode has no runs to anchor to, and needs
+        `translation_host()` to find the same place from the outside.
+        """
+        span = make_tag("span")
+        if translation_style:
+            span["style"] = translation_style
+        span.string = f" {t_text}"
+        stamp_translation(span, unit.element, language)
+        unit.nodes[-1].insert_after(span)
+
+    @staticmethod
+    def _markup_covers_run(markup, owned):
+        """Does `markup` hold this run's text and nothing else of the book's?
+
+        The question both insertion paths turn on: a tag that covers the
+        whole run can carry the translation (as a clone, or by replacement),
+        while one covering only part of it must not — handing a whole
+        sentence a fragment's styling is what makes an <a> swallow the
+        sentence into a link, or a drop-cap <span> into its first letter.
+        """
+        return isinstance(markup, Tag) and owned <= {
+            id(n) for n in markup.descendants if isinstance(n, NavigableString)
+        }
+
+    @staticmethod
+    def _insert_anchored_translation(unit, t_text, translation_style="", language=None):
+        """Append a translation next to the run it translates.
+
+        For owners that cannot be cloned — a wrapper holding nested blocks,
+        or <body> itself — the translated copy goes immediately after this
+        run's own markup, so it lands between the same neighbours the source
+        text sits between instead of after the whole wrapper.
+
+        When that markup covers the whole run — <span class="lin"> holding
+        one verse line — the translation is a clone of it, not a bare
+        <span>: the book's CSS (`span.lin { margin-left: 5em }`) must style
+        both renderings, the same rule block clones already follow. A tag
+        covering only part of the run keeps the bare <span>, because
+        cloning it would hand the whole sentence a fragment's styling —
+        the hazard `_write_single_translation` documents.
+        """
+        tail = inline_subtree_root(unit.nodes[-1], unit.resolver)
+        if tail.name != "ruby" and EPUBBookLoader._markup_covers_run(
+            tail, {id(n) for n in unit.nodes}
+        ):
+            span = copy(tail)
+            restamp_language(span, language)
+            span.clear()
+            # a translated copy is a second rendering, not a second anchor
+            strip_duplicate_ids(span)
+        else:
+            span = make_tag("span")
+            stamp_translation(span, unit.element, language)
+        if translation_style:
+            span["style"] = translation_style
+        span.string = t_text
+        # inserted in the order they are read — run, break, translation.
+        # `make_tag` is what keeps the break a single <br/>; see helper.py.
+        line_break = make_tag("br")
+        tail.insert_after(line_break)
+        line_break.insert_after(span)
+
+    @staticmethod
+    def _write_single_translation(unit, t_text, translation_style="", language=None):
+        """Put a segment's translation where the segment was.
+
+        The translation replaces the first owned node *only when the markup
+        around that node covers the whole segment*. Otherwise it goes at the
+        position of that markup instead, because writing it inside would
+        hand the whole sentence to a fragment's styling: an <a> wrapping
+        three words would make the entire translated sentence a link, and a
+        drop-cap <span> would swallow the paragraph into its first letter.
+
+        Emptied inline wrappers are then removed. Keeping them would leave
+        `<a href="…"></a>` husks — an unclickable link is not preservation.
+        """
+        translation = EPUBBookLoader._styled_translation(t_text, translation_style)
+        # a bare string has nowhere to carry a tag; a styled <span> does
+        stamp_translation(translation, unit.element, language)
+        container = unit.nodes[0]
+        if unit.resolver is not None:
+            container = inline_subtree_root(unit.nodes[0], unit.resolver)
+        if EPUBBookLoader._markup_covers_run(container, {id(n) for n in unit.nodes}):
+            # Wrappers of the *later* nodes empty here just as they do on the
+            # anchored path below: a run of several <ruby> bases keeps only
+            # its first position, and the other bases' now-annotationless
+            # rubies would survive as <ruby></ruby> — a file epubcheck
+            # rejects (RSC-005 "element ruby incomplete", 53 on kusamakura).
+            emptied = EPUBBookLoader._collect_wrappers(unit.nodes[1:], unit.element)
+            unit.nodes[0].replace_with(translation)
+            for node in unit.nodes[1:]:
+                node.extract()
+            EPUBBookLoader._remove_emptied_wrappers(emptied)
+            return
+
+        anchor = container if isinstance(container, Tag) else unit.nodes[0]
+        # only wrappers *we* empty are ours to remove: an already-empty
+        # <a id="…"> is a link target the book still needs
+        emptied = EPUBBookLoader._collect_wrappers(unit.nodes, unit.element)
+        anchor.insert_before(translation)
+        for node in unit.nodes:
+            node.extract()
+        EPUBBookLoader._remove_emptied_wrappers(emptied)
+
+    @staticmethod
+    def _styled_translation(t_text, translation_style=""):
+        """The translated text as it goes into the document.
+
+        A style declaration has to hang on an element, so asking for one
+        turns the string into a <span>. Without one it stays a string: a
+        wrapper no book asked for is markup the original did not have.
+        """
+        if not translation_style:
+            return NavigableString(t_text)
+        span = make_tag("span")
+        span["style"] = translation_style
+        span.string = t_text
+        return span
+
+    @staticmethod
+    def _collect_wrappers(nodes, stop):
+        """The inline ancestors these nodes are about to leave empty,
+        outermost first, each once."""
+        emptied = {}
+        for node in nodes:
+            for ancestor in node.parents:
+                if ancestor is stop:
+                    break
+                # by identity: the same wrapper holds several owned nodes,
+                # and visiting it twice would decompose an already-gone tag
+                emptied[id(ancestor)] = ancestor
+        return list(emptied.values())
+
+    @staticmethod
+    def _remove_emptied_wrappers(emptied):
+        # depth-first so an inner wrapper is gone before its parent is judged
+        for element in reversed(emptied):
+            if element.parent is None or element.attrs is None:
+                continue  # already detached with an enclosing wrapper
+            if (
+                element.name in _KEEP_WHEN_EMPTY
+                or element.get("id")
+                or (element.name == "a" and element.get("name"))
+            ):
+                continue
+            if element.find(string=True) is not None:
+                continue
+            # An id *inside* the husk is a link target just the same:
+            # <span><a id="ch1">Chapter One</a></span> is how a heading marks
+            # itself, and deleting the wrapper takes with it the anchor every
+            # cross-reference in the book points at.
+            if (
+                element.find(list(_KEEP_WHEN_EMPTY))
+                or element.find(attrs={"id": True})
+                or element.find("a", attrs={"name": True})
+            ):
+                continue
+            # extract, not decompose: decompose clears the state of every
+            # descendant, and a later run in the same document may still
+            # hold references into this subtree
+            element.extract()
 
     def _translate_texts_aligned(self, texts, translator=None):
         """translate_list with an alignment ladder: group -> halves -> singles.
@@ -886,14 +1407,17 @@ class EPUBBookLoader(BaseBookLoader):
             for code_tag in code_placeholders:
                 temp_p.append(copy(code_tag))
 
-            # Replace original content
+            # Replace original content: the element now holds the translation
             p.clear()
             for content in temp_p.contents:
                 p.append(copy(content))
+            restamp_language(p, self.language_tag)
         else:
             # Bilingual mode: keep original paragraph with code, add translation after
             if has_restricted_content_model(p):
-                append_inline_translation(p, translated_text, translation_style)
+                append_inline_translation(
+                    p, translated_text, translation_style, self.language_tag
+                )
                 return
             new_p = copy(p)
             # Remove code tags from translation
@@ -903,9 +1427,44 @@ class EPUBBookLoader(BaseBookLoader):
             new_p.string = translated_text
             # a translated copy is a second rendering, not a second anchor
             strip_duplicate_ids(new_p)
+            restamp_language(new_p, self.language_tag)
             if translation_style != "":
                 new_p["style"] = translation_style
             p.insert_after(new_p)
+
+    def _show_usage(self, pbar):
+        """Pin in/out/cached tokens on the bar, once a request reported them.
+
+        `cached` is the number session mode is watched by: a history read
+        back at full price every request shows up here and nowhere else.
+        """
+        try:
+            postfix = self._usage_postfix()
+            if postfix:
+                pbar.set_postfix(postfix, refresh=False)
+        except Exception:
+            pass  # a readout; never a reason to stop the run it decorates
+
+    def _usage_postfix(self):
+        return getattr(self.translate_model, "usage_postfix", lambda: None)()
+
+    def _usage_suffix(self):
+        try:
+            postfix = self._usage_postfix()
+            if not postfix:
+                return ""
+            return " " + " ".join(f"{k}={v}" for k, v in postfix.items())
+        except Exception:
+            return ""
+
+    def _print_usage(self):
+        """One closing line, printed even under --quiet: the bill is not noise."""
+        try:
+            summary = getattr(self.translate_model, "usage_summary", lambda: None)()
+            if summary:
+                print(summary)
+        except Exception:
+            pass
 
     def _process_paragraph(self, p, new_p, index, p_to_save_len, thread_safe=False):
         if self.resume and index < p_to_save_len:
@@ -1365,13 +1924,17 @@ class EPUBBookLoader(BaseBookLoader):
         global_index = 0
 
         for document_index, item in enumerate(document_items):
-            include_in_output = True
             should_translate = True
 
+            # Both filters choose what gets *translated*. Neither removes a
+            # document from the book: the new book copies the source's spine
+            # wholesale, so a dropped document leaves the spine, the nav and
+            # the NCX pointing at a file that is not in the package
+            # (epubcheck RSC-007) — a broken book, from a flag that only ever
+            # claimed to narrow the work.
             if self.only_filelist and item.file_name not in self.only_filelist.split(
                 ","
             ):
-                include_in_output = False
                 should_translate = False
             elif (
                 not self.only_filelist
@@ -1447,14 +2010,7 @@ class EPUBBookLoader(BaseBookLoader):
                     )
                 )
 
-            plans.append(
-                ChapterTranslationPlan(
-                    item=item,
-                    soup=soup,
-                    jobs=jobs,
-                    include_in_output=include_in_output,
-                )
-            )
+            plans.append(ChapterTranslationPlan(item=item, soup=soup, jobs=jobs))
 
         return plans
 
@@ -1564,6 +2120,7 @@ class EPUBBookLoader(BaseBookLoader):
                     if self._process_paragraph_sentence_mode(p, soup):
                         index += 1
                         pbar.update(1)
+                        self._show_usage(pbar)
                         if not self.quiet:
                             print()
                         if self.is_test and index >= self.test_num:
@@ -1580,6 +2137,7 @@ class EPUBBookLoader(BaseBookLoader):
                             p_block, index, p_to_save_len, thread_safe=False
                         )
                         pbar.update(n)
+                        self._show_usage(pbar)
                         p_block = []
                         if not self.quiet:
                             print()
@@ -1590,6 +2148,7 @@ class EPUBBookLoader(BaseBookLoader):
                     if not self.quiet:
                         print()
                     pbar.update(1)
+                    self._show_usage(pbar)
 
                 if self.is_test and index >= self.test_num:
                     is_test_done = True
@@ -1601,6 +2160,7 @@ class EPUBBookLoader(BaseBookLoader):
                     p_block, index, p_to_save_len, thread_safe=False
                 )
                 pbar.update(n)
+                self._show_usage(pbar)
 
         if soup:
             item.content = soup.encode(encoding="utf-8")
@@ -1976,6 +2536,7 @@ class EPUBBookLoader(BaseBookLoader):
             self.accumulated_num,
             self.translation_style,
             self.context_flag,
+            language=self.language,
         )
 
         # Check for fatal errors before starting
@@ -2053,7 +2614,16 @@ class EPUBBookLoader(BaseBookLoader):
                 if item.get_type() != ITEM_DOCUMENT:
                     new_book.add_item(item)
 
-            output_plans = [plan for plan in chapter_plans if plan.include_in_output]
+            # A document with no jobs — filtered out by --only_filelist or
+            # --exclude_filelist, or simply holding nothing to translate —
+            # goes into the book exactly as it came, without a parse and
+            # serialize round-trip it has no reason to pay for.
+            output_plans = []
+            for plan in chapter_plans:
+                if plan.jobs:
+                    output_plans.append(plan)
+                else:
+                    new_book.add_item(plan.item)
 
             if self.enable_parallel and len(output_plans) > 1:
                 # Optimize worker count: no point having more workers than chapters
@@ -2122,6 +2692,7 @@ class EPUBBookLoader(BaseBookLoader):
                             chapter_pbar.update(1)
                             chapter_pbar.set_postfix_str(
                                 f"Latest: {item.file_name[:20]}..."
+                                + self._usage_suffix()
                             )
 
                         except Exception as e:
@@ -2131,6 +2702,7 @@ class EPUBBookLoader(BaseBookLoader):
                             chapter_pbar.update(1)
 
                 chapter_pbar.close()
+                self._print_usage()
                 if failed_chapters:
                     # fail loud: a partial book must not masquerade as done
                     for file_name, error in failed_chapters:
@@ -2150,9 +2722,7 @@ class EPUBBookLoader(BaseBookLoader):
                 if len(output_plans) == 1 and self.enable_parallel:
                     print(f"📄 Single chapter detected - using sequential processing")
 
-                for chapter_plan in chapter_plans:
-                    if not chapter_plan.include_in_output:
-                        continue
+                for chapter_plan in output_plans:
                     item = chapter_plan.item
                     # Check for fatal error before processing each item
                     if self.translate_model._fatal_error_detected:
@@ -2160,10 +2730,6 @@ class EPUBBookLoader(BaseBookLoader):
                             "[bold red]Fatal translation error detected. Stopping book creation.[/bold red]"
                         )
                         return
-
-                    if not chapter_plan.jobs:
-                        new_book.add_item(item)
-                        continue
 
                     index = self.process_item(
                         item,
@@ -2185,6 +2751,7 @@ class EPUBBookLoader(BaseBookLoader):
 
                 # Close progress bar
                 pbar.close()
+                self._print_usage()
 
                 if self.accumulated_num > 1:
                     name, _ = os.path.splitext(self.epub_name)
@@ -2200,11 +2767,18 @@ class EPUBBookLoader(BaseBookLoader):
                 print("you can resume it next time")
                 self._save_progress()
                 self._save_temp_book()
-            sys.exit(0)
+            # A halted run has no finished book. 0 told every caller — a
+            # script, a shell, an agent — that it did, and the shell's own
+            # code for a process killed by SIGINT is 130.
+            sys.exit(130)
         except Exception as e:
             # Handle connection errors gracefully
             error_msg = str(e)
-            if "Connection" in error_msg or "connection" in error_msg:
+            if getattr(e, "user_facing", False):
+                # The message is the whole explanation — a traceback on top
+                # of it only buries what the reader needs.
+                print(f"[bold red]{escape(error_msg)}[/bold red]")
+            elif "Connection" in error_msg or "connection" in error_msg:
                 print(
                     f"[bold red]Translation failed: Connection error - {error_msg}[/bold red]"
                 )
@@ -2213,8 +2787,16 @@ class EPUBBookLoader(BaseBookLoader):
                 traceback.print_exc()
             if self.accumulated_num == 1:
                 print("Saving progress...")
-                self._save_progress()
-                self._save_temp_book()
+                try:
+                    self._save_progress()
+                    self._save_temp_book()
+                except Exception:
+                    # `_save_temp_book` re-raises so a failed recovery book is
+                    # never silent, but here it is already reported and the
+                    # run's own failure is the one that owes the caller an
+                    # exit code — letting it escape would lose the sys.exit
+                    # below and report the wrong cause.
+                    traceback.print_exc()
             # the run failed and there is no output book; exiting 0 would
             # tell every caller the opposite
             sys.exit(1)
@@ -2253,6 +2835,8 @@ class EPUBBookLoader(BaseBookLoader):
             raise Exception("can not load resume file")
 
     def _save_temp_book(self):
+        name, _ = os.path.splitext(self.epub_name)
+        temp_path = f"{name}_bilingual_temp.epub"
         origin_book_temp = epub.read_epub(self.epub_name)
         new_temp_book = self._make_new_book(origin_book_temp)
         trans_taglist = self.translate_tags.split(",")
@@ -2267,8 +2851,6 @@ class EPUBBookLoader(BaseBookLoader):
                     # replay must walk exactly the selection the processing
                     # pass walked or global_index lands on unrelated text
                     chapter_plan = next(chapter_plans)
-                    if not chapter_plan.include_in_output:
-                        continue
                     for job in chapter_plan.jobs:
                         if job.global_index >= len(self.p_to_save):
                             break
@@ -2297,11 +2879,16 @@ class EPUBBookLoader(BaseBookLoader):
                             )
                     item.content = chapter_plan.soup.encode()
                 new_temp_book.add_item(item)
-            name, _ = os.path.splitext(self.epub_name)
-            epub.write_epub(f"{name}_bilingual_temp.epub", new_temp_book, {})
+            epub.write_epub(temp_path, new_temp_book, {})
         except Exception as e:
-            # TODO handle it
-            print(e)
+            # The recovery book is the only artifact a crashed run leaves
+            # behind. Swallowing this told the user nothing and they found
+            # out at the next --resume, with no temp book to show.
+            print(
+                f"[bold red]could not write the recovery book "
+                f"{temp_path}: {e}[/bold red]"
+            )
+            raise
 
     def _save_progress(self):
         completed_job_ids = self._planned_job_ids[: len(self.p_to_save)]

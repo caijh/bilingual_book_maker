@@ -18,6 +18,7 @@ from book_maker.loader.helper import (
     EPUBBookLoaderHelper,
     backfill_toc_hrefs,
     derive_translation_identity,
+    rebase_ncx_srcs,
     strip_duplicate_ids,
 )
 
@@ -399,3 +400,143 @@ def test_a_section_with_an_href_keeps_it():
     backfill_toc_hrefs(toc)
 
     assert section.href == "intro.xhtml"
+
+
+NCX = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">'
+    "<navMap>{}</navMap></ncx>"
+).format
+
+
+def _srcs(ncx_bytes):
+    soup = bs(ncx_bytes, "html.parser")
+    return [c["src"] for c in soup.find_all("content")]
+
+
+def test_a_subdirectory_ncx_gets_its_srcs_rebased():
+    """RSC-007: ebooklib writes navpoint srcs relative to the OPF root, but
+    the writer keeps the imported NCX's own location — from xhtml/toc.ncx a
+    root-relative src resolves to xhtml/xhtml/…, a file that does not
+    exist (kusamakura)."""
+    ncx = NCX(
+        '<navPoint id="a"><content src="xhtml/one.xhtml"/></navPoint>'
+        '<navPoint id="b"><content src="xhtml/two.xhtml#frag"/></navPoint>'
+    ).encode()
+
+    out = rebase_ncx_srcs(ncx, "xhtml/toc.ncx")
+
+    assert _srcs(out) == ["one.xhtml", "two.xhtml#frag"]
+
+
+def test_a_root_ncx_passes_through_byte_identical():
+    ncx = NCX('<navPoint id="a"><content src="xhtml/one.xhtml"/></navPoint>').encode()
+
+    assert rebase_ncx_srcs(ncx, "toc.ncx") is ncx
+
+
+def test_srcs_outside_the_ncx_directory_step_out_of_it():
+    ncx = NCX('<navPoint id="a"><content src="text/ch1.xhtml"/></navPoint>').encode()
+
+    assert _srcs(rebase_ncx_srcs(ncx, "nav/toc.ncx")) == ["../text/ch1.xhtml"]
+
+
+def test_absolute_and_empty_srcs_are_left_alone():
+    ncx = NCX(
+        '<navPoint id="a"><content src="https://example.com/x"/></navPoint>'
+        '<navPoint id="b"><content src=""/></navPoint>'
+    ).encode()
+
+    assert _srcs(rebase_ncx_srcs(ncx, "xhtml/toc.ncx")) == [
+        "https://example.com/x",
+        "",
+    ]
+
+
+def test_the_translated_sibling_is_stamped_with_the_target_language():
+    """A German epigraph's Chinese translation is not German (260901 operator
+    finding): the copy keeps every attribute the original had, so the
+    language attributes must be rewritten, and only when present."""
+    from bs4 import BeautifulSoup
+    from book_maker.loader.helper import EPUBBookLoaderHelper
+
+    soup = BeautifulSoup(
+        '<body><div xml:lang="de" lang="de">Bin gar keine Russin</div>'
+        "<p>plain</p></body>",
+        "html.parser",
+    )
+    helper = EPUBBookLoaderHelper(None, 1, "", False, language="zh-hans")
+    helper.insert_trans(soup.div, "我根本不是俄国人")
+    helper.insert_trans(soup.p, "平常")
+    divs = soup.find_all("div")
+    assert divs[0]["xml:lang"] == "de" and divs[0]["lang"] == "de"
+    assert divs[1]["xml:lang"] == "zh-hans" and divs[1]["lang"] == "zh-hans"
+    ps = soup.find_all("p")
+    assert "xml:lang" not in ps[1].attrs and "lang" not in ps[1].attrs
+
+
+def test_the_stamp_is_a_language_tag_not_the_prompt_wording():
+    """Codex review 2 on #553: the loader receives the prompt wording
+    ("simplified chinese"), and `xml:lang="simplified chinese"` is a value
+    validators reject. The wording becomes its code; a wording nothing knows
+    stamps nothing rather than something invalid."""
+    from bs4 import BeautifulSoup
+    from book_maker.loader.helper import EPUBBookLoaderHelper, language_tag
+
+    assert language_tag("simplified chinese") == "zh"
+    assert language_tag("zh-hans") == "zh-hans"
+    assert language_tag("pt-BR") == "pt-BR"
+    assert language_tag("Klingon, but formal") is None
+    assert language_tag(None) is None
+
+    soup = BeautifulSoup(
+        '<body><div lang="de">Bin gar keine Russin</div></body>', "html.parser"
+    )
+    EPUBBookLoaderHelper(
+        None, 1, "", False, language="simplified chinese"
+    ).insert_trans(soup.div, "我根本不是俄国人")
+    assert soup.find_all("div")[1]["lang"] == "zh"
+
+    soup = BeautifulSoup(
+        '<body><div lang="de">Bin gar keine Russin</div></body>', "html.parser"
+    )
+    EPUBBookLoaderHelper(
+        None, 1, "", False, language="Klingon, but formal"
+    ).insert_trans(soup.div, "我根本不是俄国人")
+    # nothing valid to say, so the copy keeps what it had: not an invalid value
+    assert soup.find_all("div")[1]["lang"] == "de"
+
+
+def test_a_translation_span_the_loader_made_declares_its_language():
+    """The inline paths make a bare <span>; inside `<p lang="de">` it would
+    read as German. Stamped only when the source element itself declares a
+    language, the rule the clone paths follow."""
+    from bs4 import BeautifulSoup
+    from book_maker.loader.helper import append_inline_translation, stamp_translation
+
+    soup = BeautifulSoup(
+        '<nav><ol><li><a href="c.xhtml" xml:lang="de" lang="de">Kapitel</a></li></ol></nav>',
+        "html.parser",
+    )
+    span = append_inline_translation(soup.a, "章节", language="zh-hans")
+    assert span["lang"] == "zh-hans" and span["xml:lang"] == "zh-hans"
+
+    plain = BeautifulSoup("<p>plain</p>", "html.parser").p
+    made = BeautifulSoup("<span>x</span>", "html.parser").span
+    stamp_translation(made, plain, "zh-hans")
+    assert "lang" not in made.attrs
+
+
+def test_the_stamp_takes_whatever_language_it_is_handed():
+    """A --language nobody sanitised — a number, bytes, spaces — stamps
+    nothing rather than raising inside the loader."""
+    from bs4 import BeautifulSoup
+    from book_maker.loader.helper import language_tag, stamp_translation
+
+    assert language_tag(3) is None
+    assert language_tag("  ") is None
+    assert language_tag(b"ja") is None
+    assert language_tag("  ja ") == "ja"
+    div = BeautifulSoup('<div lang="de">x</div>', "html.parser").div
+    assert stamp_translation("not a node", div, "ja") == "not a node"
+    assert stamp_translation(div, None, "ja") is div

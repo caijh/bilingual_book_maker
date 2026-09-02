@@ -78,12 +78,30 @@ MAX_USABLE_CONTEXT_WINDOW = 10_000_000
 # A lookup that keeps erroring is an endpoint that will not answer this run.
 CONTEXT_WINDOW_LOOKUP_ATTEMPTS = 3
 
+# What to do instead, appended to every refusal below.
+AUTO_BUDGET_ADVICE = (
+    "Pass a number instead: 8000 is the default, 2500 the cheapest setting "
+    "on most endpoints."
+)
+
 CHATGPT_CONFIG = config["translator"]["chatgptapi"]
 
 PROMPT_ENV_MAP = {
     "user": "BBM_CHATGPTAPI_USER_MSG_TEMPLATE",
     "system": "BBM_CHATGPTAPI_SYS_MSG",
 }
+
+
+class ContextWindowUnknown(Exception):
+    """`--context-compact-at 0` was asked for and the endpoint cannot answer.
+
+    There is no honest fallback: a default budget is a guess about the very
+    model nobody could size, and the flag exists to stop the user guessing.
+    The message is the whole explanation, so callers print it rather than a
+    traceback.
+    """
+
+    user_facing = True
 
 
 class StructuredOutputUnsupported(Exception):
@@ -324,6 +342,9 @@ class ChatGPTAPI(Base):
     # probing them would send the capability request to the wrong endpoint.
     SUPPORTS_STRUCTURED_OUTPUTS = True
 
+    SUPPORTS_SESSION_CONTEXT = True
+    SUPPORTS_PARALLEL_CONTEXT = True
+
     # Session-mode state, declared here so the window-mode path is well
     # defined on any instance — including the subclasses and test fixtures
     # that build one without running __init__. `session is None` means window
@@ -394,13 +415,8 @@ class ChatGPTAPI(Base):
         self.context_compact_at = context_compact_at
         self.no_context_compact = no_context_compact
         self._model_windows = {}
-        self._window_misses = set()
-        self._window_lookup_failures = 0
         self.style_note = style_note
         self.handoff_path = Path(handoff_path) if handoff_path else None
-        self._session_cache_warned = False
-        self._session_cache_seen = False
-        self._session_requests = 0
         self._compact_failures = 0
         if context_paragraph_limit > 0:
             # not set by user, use default
@@ -640,6 +656,7 @@ class ChatGPTAPI(Base):
             )
         except RUNG_REFUSAL_ERRORS as e:
             raise RungRejected(e) from e
+        self._note_usage(completion)
         return completion.choices[0].message.content
 
     def _json_schema_rung(self, prompt, schema, model):
@@ -810,6 +827,7 @@ class ChatGPTAPI(Base):
                 )
             completion = await create({})
 
+        self._note_usage(completion)
         translated = completion.choices[0].message.content or ""
         if self.context_flag:
             current_context = current_context.append(
@@ -913,9 +931,9 @@ class ChatGPTAPI(Base):
             # Answered with something that is not the schema.
             raise StructuredOutputUnsupported(str(e)) from e
 
-        # Take the cache reading before ruling on the message: session mode
-        # runs on this path, and the bill is the same whatever the answer says.
-        self._note_cache_usage(completion)
+        # Meter before ruling on the message: the bill is the same whatever
+        # the answer says.
+        self._note_usage(completion)
 
         message = completion.choices[0].message
         if getattr(message, "refusal", None):
@@ -928,48 +946,49 @@ class ChatGPTAPI(Base):
 
     def _plain_translation(self, text):
         completion = self.create_chat_completion(text)
-        self._note_cache_usage(completion)
+        self._note_usage(completion)
         content = completion.choices[0].message.content
         return content.encode("utf8").decode() if content else ""
 
     # ---- session mode -----------------------------------------------------
-
-    # How many requests to allow before concluding the endpoint is not billing
-    # cache reads. One miss is normal (nothing is cached yet), and short books
-    # should not be nagged.
-    CACHE_WARN_AFTER = 10
 
     # Compact attempts before giving up on a summary and starting clean. More
     # than one so a transient error does not cost the accumulated context;
     # bounded so a broken endpoint cannot grow the history forever.
     COMPACT_ATTEMPTS = 3
 
-    def _note_cache_usage(self, completion):
-        """Warn once if session mode never gets a cache read billed back.
+    def _note_usage(self, completion):
+        """Add what the endpoint billed for this request to the meter.
 
-        Without pass-through caching this mode re-reads the whole history at
-        full input price on every request — strictly worse than the window
-        mode it replaces. That is invisible in the output and only shows up on
-        the bill, so it has to be said out loud.
+        `cached_tokens` is what session mode is watched by: without
+        pass-through caching the history is re-read at full price every
+        request, and only this number says so.
         """
-        if self.session is None or self._session_cache_warned:
+        try:
+            usage = getattr(completion, "usage", None)
+            if usage is None:
+                return
+            details = getattr(usage, "prompt_tokens_details", None)
+            self.usage.note(
+                getattr(usage, "prompt_tokens", 0),
+                getattr(usage, "completion_tokens", 0),
+                getattr(details, "cached_tokens", 0),
+            )
+        except Exception:
+            # a readout, not a gate: a usage record shaped strangely by a
+            # gateway is not a reason to stop a paid run
             return
-        usage = getattr(completion, "usage", None)
-        details = getattr(usage, "prompt_tokens_details", None)
-        if getattr(details, "cached_tokens", 0):
-            self._session_cache_seen = True
-            return
-        self._session_requests += 1
-        if self._session_cache_seen or self._session_requests < self.CACHE_WARN_AFTER:
-            return
-        self._session_cache_warned = True
-        print(
-            "[bold yellow]Warning:[/bold yellow] this endpoint has not reported "
-            "a single cached prompt token after "
-            f"{self._session_requests} requests. Session mode assumes prompt "
-            "caching is billed through; without it the history is charged at "
-            "full price every request. Consider --use_context (window mode)."
-        )
+
+    def preflight(self):
+        """Settle what must be known before the first paid request.
+
+        Only `--context-compact-at 0` needs it, and it needs it here: the
+        budget is the endpoint's answer about every model in play, so asking
+        at the first compaction would learn a book too late — and would
+        learn it after the money was spent.
+        """
+        if self.context_compact_at == 0:
+            self._model_sized_budget()
 
     def _session_budget(self):
         """How large a window may grow before it rolls over.
@@ -988,62 +1007,58 @@ class ChatGPTAPI(Base):
 
         `--model_list` rotates a model per request and the history is shared
         across all of them, so the budget has to be one the smallest window
-        survives. Every configured model is measured here, before the history
-        is big enough for the smallest to choke on — learning a model's window
-        from the request that failed on it would be learning it too late.
+        survives. Every configured model is measured, and a model that cannot
+        be measured ends the run rather than borrowing the default: the
+        default would be a guess about the one model nobody could size, and
+        guessing is what `0` was passed to avoid.
         """
         models = list(self._model_names) or [self.model]
-        for model in models:
-            self._learn_context_window(model)
-        known = [self._model_windows[m] for m in models if m in self._model_windows]
-        default = compact_budget_for(self.model)
-        if not known:
-            return default
-        budget = min(known) * 9 // 10
-        if len(known) < len(models):
-            # A model nobody could measure may be the smallest of them. Sizing
-            # the shared history past what the default already assumed safe
-            # would be betting on the one number we do not have.
-            return min(budget, default)
-        return budget
+        return min(self._learn_context_window(m) for m in models) * 9 // 10
 
     def _learn_context_window(self, model):
-        """Ask the endpoint about `model` once, and remember what it said."""
-        if model in self._model_windows or model in self._window_misses:
-            return
-        if self._window_lookup_failures >= CONTEXT_WINDOW_LOOKUP_ATTEMPTS:
-            return
-        try:
-            reported = self._detect_context_window(model)
-        except NotFoundError:
-            # A definitive answer: this endpoint has no such record. Asking
-            # again would get the same 404 for every paragraph of the book.
-            reported = None
-        except Exception as e:
-            # Not an answer at all — a timeout, a refreshed token, a 5xx. The
-            # budget falls back for now and the next unit asks again, since a
-            # transient blip should not silently cost the whole run its
-            # auto-sizing. Bounded, so a dead route is not asked forever.
-            self._window_lookup_failures += 1
-            if self._window_lookup_failures >= CONTEXT_WINDOW_LOOKUP_ATTEMPTS:
-                print(
-                    f"[yellow]ℹ could not ask this endpoint for {model}'s "
-                    f"context window ({e}); compacting at the default "
-                    f"{compact_budget_for(model)} instead[/yellow]"
+        """The window this endpoint reports for `model`. Asked once.
+
+        Raises `ContextWindowUnknown` on any answer that is not a usable
+        number: a 404 or a record without the field is definitive, and a
+        transport failure is retried up to `CONTEXT_WINDOW_LOOKUP_ATTEMPTS`
+        before it becomes one too.
+        """
+        if model in self._model_windows:
+            return self._model_windows[model]
+        last_error = None
+        for _ in range(CONTEXT_WINDOW_LOOKUP_ATTEMPTS):
+            try:
+                reported = self._detect_context_window(model)
+            except NotFoundError as e:
+                # Definitive: this endpoint has no such record, and asking
+                # again would collect the same 404.
+                raise ContextWindowUnknown(
+                    f"--context-compact-at 0 sizes the budget from the "
+                    f"model's own context window, and this endpoint has no "
+                    f"record of {model!r} to read one from. "
+                    f"{AUTO_BUDGET_ADVICE}"
+                ) from e
+            except Exception as e:
+                # Not an answer at all — a timeout, a refreshed token, a 5xx.
+                last_error = e
+                continue
+            if reported is None:
+                raise ContextWindowUnknown(
+                    f"--context-compact-at 0 sizes the budget from the "
+                    f"model's own context window, and this endpoint reports "
+                    f"no usable one for {model!r}. {AUTO_BUDGET_ADVICE}"
                 )
-            return
-        if reported:
             self._model_windows[model] = reported
             print(
                 f"[cyan]ℹ {model} reports a {reported}-token context window; "
                 f"compacting at {reported * 9 // 10}[/cyan]"
             )
-            return
-        self._window_misses.add(model)
-        print(
-            f"[yellow]ℹ this endpoint does not report a context window for "
-            f"{model}; compacting at the default {compact_budget_for(model)} "
-            f"instead[/yellow]"
+            return reported
+        raise ContextWindowUnknown(
+            f"--context-compact-at 0 sizes the budget from the model's own "
+            f"context window, and this endpoint could not be asked for "
+            f"{model!r} in {CONTEXT_WINDOW_LOOKUP_ATTEMPTS} attempts "
+            f"({last_error}). {AUTO_BUDGET_ADVICE}"
         )
 
     def _detect_context_window(self, model):
@@ -1204,7 +1219,7 @@ class ChatGPTAPI(Base):
                 # but the plain path has no JSON to truncate — retranslate there
                 # rather than ending a multi-hour run over one paragraph.
                 # The truncated request was still billed, so it still counts.
-                self._note_cache_usage(getattr(e, "completion", None))
+                self._note_usage(getattr(e, "completion", None))
                 print(
                     "[yellow]ℹ structured answer was truncated; retranslating "
                     "this paragraph without a schema[/yellow]"
@@ -1439,7 +1454,7 @@ class ChatGPTAPI(Base):
         except (ValidationError, json.JSONDecodeError) as e:
             raise StructuredOutputUnsupported(str(e)) from e
 
-        self._note_cache_usage(completion)
+        self._note_usage(completion)
 
         message = completion.choices[0].message
         if getattr(message, "refusal", None):
@@ -1453,6 +1468,23 @@ class ChatGPTAPI(Base):
         if len(paragraphs) != plist_len:
             raise ValueError(
                 f"Expected {plist_len} translations, got {len(paragraphs)}"
+            )
+
+        # Count is not alignment. A model that merges two source lines into
+        # one slot (routine on verse: one sentence spans two pādas) keeps
+        # the count by shifting the rest and padding a slot with "" — the
+        # only unambiguous symptom of the shift. An empty slot for a
+        # non-empty input is therefore a misaligned window, never a valid
+        # translation: retry it.
+        empty_slots = [
+            i
+            for i, (src, out) in enumerate(zip(text_list, paragraphs))
+            if not out.strip() and src.strip()
+        ]
+        if empty_slots:
+            raise ValueError(
+                f"Empty translation for non-empty paragraph(s) {empty_slots}: "
+                f"batch alignment lost"
             )
 
         if self.context_flag:
@@ -1550,8 +1582,12 @@ class ChatGPTAPI(Base):
                 "api_models": [],
             }
 
-        available_models = list(set(custom_model_list) & set(api_models))
-        unavailable_models = list(set(custom_model_list) - set(api_models))
+        # Order is the user's, not the endpoint's: --model_list a,b names a
+        # first on purpose — the first id is the one the structured-output
+        # probe grades and the one the session budget is sized from.
+        served = set(api_models)
+        available_models = [m for m in custom_model_list if m in served]
+        unavailable_models = [m for m in custom_model_list if m not in served]
 
         if not available_models:
             print(
@@ -1697,7 +1733,9 @@ class ChatGPTAPI(Base):
         self._set_models("O3-mini", "o3-mini", set(O3MINI_MODEL_LIST))
 
     def set_model_list(self, model_list):
-        model_list = list(set(model_list))
+        # dict.fromkeys drops repeats while keeping the order they were
+        # given in; a set would reorder them differently on every run.
+        model_list = list(dict.fromkeys(model_list))
         if not model_list:
             raise Exception(
                 "Empty model list provided. Use --model_list with at least one model name."

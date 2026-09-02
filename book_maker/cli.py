@@ -8,6 +8,7 @@ from rich import print
 from rich.markup import escape
 
 from book_maker.loader import BOOK_LOADER_DICT
+from book_maker.loader.ledger import PlanLedgerError
 from book_maker.translator import MODEL_DICT
 from book_maker.provider_loader import get_provider, get_translator_class
 from book_maker.utils import LANGUAGES, TO_LANGUAGE_CODE
@@ -71,8 +72,18 @@ def parse_prompt_arg(prompt_arg):
 
             return prompt
         except Exception as e:
-            print(f"Error parsing PromptDown file: {e}")
-            # Fall through to other parsing methods
+            # Falling through left `prompt` half-built and the next line
+            # died on `prompt["user"]` with a KeyError traceback — after
+            # the run had already printed that the file loaded. The pinned
+            # promptdown reads the block form only; its table form (which
+            # this repo's own prompt_md.prompt.md still uses) parses to a
+            # conversation with no user message.
+            raise ValueError(
+                f"could not read the PromptDown file {prompt_arg}: {e}. "
+                f"Write the conversation in block form -- a line reading "
+                f"`**User:**` followed by the template, which must contain "
+                f"`{{text}}`."
+            ) from e
 
     # Existing parsing logic for JSON strings and other formats
     if not any(prompt_arg.endswith(ext) for ext in [".json", ".txt", ".md"]):
@@ -370,15 +381,19 @@ def main():
     parser.add_argument(
         "--plan-classify",
         dest="plan_classify",
-        choices=["none", "most", "model", "agent"],
+        # "most" was this mode's name and still parses; it is left out of
+        # the metavar so --help documents one name, not two.
+        choices=["none", "all", "most", "model", "agent"],
+        metavar="{none,all,model,agent}",
         default="none",
         help="coverage-complete plan mode (epub only): partition the whole "
         "book, then decide which tag signatures are worth translating. "
         "'none' (default): no plan — translate the --translate-tags "
         "selection as usual. "
-        "'most': translate the whole partition, no classification. "
-        "'model': an LLM rules on the uncertain signatures in-pipeline, then "
-        "the run continues. "
+        "'all': translate the whole partition, no classification, no plan "
+        "file. "
+        "'model': an LLM rules on every undecided signature, then the run "
+        "continues and translates the book; unresolved rows stop it instead. "
         "'agent': write the plan JSON with samples, print instructions to "
         "paste into a coding-agent session, and stop before translating — "
         "rerun the same command afterwards to translate",
@@ -495,7 +510,7 @@ So you are close to reaching the limit. You have to choose your own value, there
         "before it is compacted into a translator handoff report. Default: "
         "8000, which costs about what window mode costs for several times "
         "the context; 2500 is the cheapest setting on most endpoints. 0 "
-        "sizes the budget from the model's own context window (90% of it), "
+        "sizes the budget from the model's own context window (90%% of it), "
         "and says so and uses the default when the endpoint reports none",
     )
     parser.add_argument(
@@ -594,8 +609,83 @@ So you are close to reaching the limit. You have to choose your own value, there
     options = parser.parse_args()
     options.context_flag, options.context_mode = resolve_context_mode(options)
 
+    # The mode was called "most" until it was renamed for being read as
+    # "most of the book". Scripts that say it keep working.
+    if options.plan_classify == "most":
+        print("note: --plan-classify most is now --plan-classify all")
+        options.plan_classify = "all"
+
     if options.provider and options.model:
         parser.error("--provider and --model are mutually exclusive")
+
+    # Two pairings of --parallel-workers have never been shown to work, and a
+    # paid book-length run is the wrong place to discover that. Refused here,
+    # before a key is read or a sidecar is started.
+    if options.parallel_workers > 1:
+        if options.model == "codex":
+            print(
+                "[bold red]Error:[/bold red] --parallel-workers is not "
+                "supported with --model codex. Codex serializes every turn "
+                "onto one thread, so there is no speed-up to win, and the run "
+                "fails partway through instead of translating. Drop "
+                "--parallel-workers."
+            )
+            exit(1)
+        if options.context_mode == "session":
+            print(
+                "[bold red]Error:[/bold red] --parallel-workers is not "
+                "supported with --use_context session. Each worker would "
+                "carry a session history of its own, and what that does to a "
+                "translation has never been tested. Drop --parallel-workers, "
+                "or drop --use_context session for this run."
+            )
+            exit(1)
+
+    # --model_list travels to the translator only on the routes that read
+    # it; every other --model runs its own preset discovery and would drop
+    # the user's explicit choice. Both halves are decided by the command
+    # line alone, so they are refused here — before a key is read, a book is
+    # parsed, or a codex sidecar is started.
+    route = options.model or (None if options.provider else "chatgptapi")
+    if route in ("openai", "groq") and not options.model_list:
+        print(
+            f"[bold red]Error: --model {route} carries no model list of its "
+            f"own; name the model ids with --model_list. For a preset set "
+            f"use --model chatgptapi, gpt4, gpt4omini or gpt5mini.[/bold red]"
+        )
+        exit(1)
+    if (
+        options.model_list
+        and not options.provider
+        and route not in ("openai", "groq", "gemini")
+    ):
+        print(
+            f"[bold red]Error: --model_list is only honored by --model openai, "
+            f"groq or gemini (or a --provider); --model {route} uses "
+            f"its own preset models and would silently ignore it.[/bold red]"
+        )
+        exit(1)
+
+    # Batch translation is OpenAI's Batch API. The codex route has no such
+    # thing, and reached it anyway: `AttributeError: batch_init` partway
+    # into a run that had already spent plan quota.
+    if route == "codex" and (options.batch_flag or options.batch_use_flag):
+        print(
+            "[bold red]Error: --batch / --batch-use are the OpenAI Batch "
+            "API, which the codex route does not have. Drop the flag, or "
+            "translate through an OpenAI-shaped route.[/bold red]"
+        )
+        exit(1)
+
+    # A codex run's context is the thread, and a thread does not survive
+    # the process. The handoff report on disk is written, never read back.
+    if route == "codex" and options.resume:
+        print(
+            "[bold yellow]Note:[/bold yellow] a resumed codex run starts a "
+            "new thread. Nothing already translated is paid for again, but "
+            "the earlier thread's terminology and register are not carried "
+            "into it."
+        )
 
     # Kobo mode supplies the source book itself. Resolve it before validating
     # --book_name so users do not need a meaningless placeholder file.
@@ -625,7 +715,14 @@ So you are close to reaching the limit. You have to choose your own value, there
 
         from book_maker.loader.plan import build_plan, is_fixed_layout
 
+        from book_maker.loader.epub_loader import check_file_filters_against
+
         book = _epub.read_epub(options.book_name)
+        # a typo in a filter is answerable here too, before a plan that
+        # would silently not honor it is written
+        check_file_filters_against(
+            book, options.only_filelist, options.exclude_filelist
+        )
         if is_fixed_layout(book):
             print(
                 "[bold yellow]warning: this is a fixed-layout (pre-paginated) "
@@ -652,15 +749,16 @@ So you are close to reaching the limit. You have to choose your own value, there
             )
         else:
             plan.save_json(plan_path, book_path=options.book_name)
-            print(f"plan written to {plan_path} (edit signature actions to override)")
-            # classification needs credentials, which dry-run must not: both
-            # --plan-classify entries act on the run that *creates* the JSON,
-            # and this dry run just created it
             print(
-                "note: this plan JSON now pins the decisions — a later "
-                "--plan-classify model/agent run will find it and translate "
-                "as-is. Delete it first to let a classifier weigh in, or "
-                "edit the actions here to stay fully manual"
+                f"plan written to {plan_path} — every row is a question: decide "
+                f'it by setting "action", "decided_by" and "content_type"'
+            )
+            # classification needs credentials, which a dry run must not
+            print(
+                "note: nothing here is decided yet. A later --plan-classify "
+                "model run rules on every row still null, an agent run hands "
+                "them to a coding agent, and rows you decide yourself are "
+                "left alone by both"
             )
         return
 
@@ -679,6 +777,54 @@ So you are close to reaching the limit. You have to choose your own value, there
         translate_model = MODEL_DICT.get("chatgptapi")
         options.model = "chatgptapi"
     assert translate_model is not None, "unsupported model"
+
+    # A format that does not implement session mode used to accept the flag
+    # and translate as though it had never been passed — the run cost more
+    # attention than a window run and bought nothing.
+    if options.context_mode == "session" and not getattr(
+        translate_model, "SUPPORTS_SESSION_CONTEXT", False
+    ):
+        print(
+            f"[bold red]Error: --use_context session is not implemented for "
+            f"the {options.provider or options.model} route; it would be "
+            f"accepted and ignored. Use bare --use_context for a re-sent "
+            f"window of paragraph pairs.[/bold red]"
+        )
+        exit(1)
+
+    # Parallel workers each get a clone carrying their own chapter context.
+    # A route that keeps no re-sendable window has nothing to clone, and the
+    # run died reading a context attribute it never set — after the chapters
+    # were already dispatched. (Codex and session mode are refused earlier,
+    # on the command line alone.)
+    if (
+        options.parallel_workers > 1
+        and options.context_mode is not None
+        and not getattr(translate_model, "SUPPORTS_PARALLEL_CONTEXT", False)
+    ):
+        print(
+            f"[bold red]Error: --parallel-workers is not supported with "
+            f"--use_context on the {options.provider or options.model} "
+            f"route, which keeps no per-chapter context for a worker to "
+            f"carry. Drop --parallel-workers, or drop --use_context for "
+            f"this run.[/bold red]"
+        )
+        exit(1)
+
+    # Sizing the budget from the model's own window is part of the session
+    # machinery: a route with no history to size has nothing to answer with,
+    # and 0 there meant "no budget at all", silently.
+    if options.context_compact_at == 0 and not getattr(
+        translate_model, "SUPPORTS_SESSION_CONTEXT", False
+    ):
+        print(
+            f"[bold red]Error: --context-compact-at 0 sizes the budget from "
+            f"the model's own context window, which only the routes that "
+            f"keep a session history can ask for (openai, claude, codex). "
+            f"The {options.provider or options.model} route needs a number."
+            f"[/bold red]"
+        )
+        exit(1)
     API_KEY = ""
     if options.model in [
         "openai",
@@ -854,11 +1000,11 @@ So you are close to reaching the limit. You have to choose your own value, there
     # contradiction, not a preference to resolve silently.
     classify_mode = options.plan_classify
     if options.plan_classify_model:
-        if classify_mode in ("most", "agent"):
+        if classify_mode in ("all", "agent"):
             reason = (
                 "agent mode makes no API call"
                 if classify_mode == "agent"
-                else "most mode skips classification"
+                else "all mode skips classification"
             )
             print(
                 f"[bold red]Error:[/bold red] --plan-classify-model cannot be "
@@ -891,16 +1037,20 @@ So you are close to reaching the limit. You have to choose your own value, there
             )
         e.plan_mode = True
         e.translate_tags = "auto"
-    if options.exclude_translate_tags:
+    # `--exclude-translate-tags ""` is the documented way to exclude nothing
+    # (README). Testing for truthiness swallowed it and left the sup,code
+    # default standing, with nothing printed to say so.
+    if options.exclude_translate_tags is not None:
         e.exclude_translate_tags = options.exclude_translate_tags
     if hasattr(e, "plan_min_coverage"):
         e.plan_min_coverage = options.plan_min_coverage
         e.poetry_group_size = options.poetry_group_size
-        # the loader keeps its original pipeline: plan mode is triggered by
-        # translate_tags == "auto", and its classify entries are
-        # none/model/agent — the CLI's 'most' is plan mode with no
-        # classification, i.e. the loader's 'none'
-        e.plan_classify = classify_mode if classify_mode != "most" else "none"
+        # plan mode is triggered by translate_tags == "auto"; the classify
+        # entry reaches the loader as chosen. "all" in particular must stay
+        # distinguishable from "no plan": it is the deliberate
+        # translate-everything decision, and the loader has to know it was
+        # made rather than infer it from the absence of one.
+        e.plan_classify = classify_mode
         e.plan_classify_model = options.plan_classify_model or None
     if options.quiet and hasattr(e, "quiet"):
         e.quiet = True
@@ -912,11 +1062,26 @@ So you are close to reaching the limit. You have to choose your own value, there
         e.exclude_filelist = options.exclude_filelist
     if options.only_filelist:
         e.only_filelist = options.only_filelist
+    # Both lists name documents inside the book, which is already open. A
+    # typo is answerable here and nowhere cheaper — before any model setup,
+    # so a sidecar boot or a context-window lookup cannot precede it.
+    if hasattr(e, "check_file_filters"):
+        e.check_file_filters()
     if options.accumulated_num > 1:
         e.accumulated_num = options.accumulated_num
     if options.translation_color:
         e.translation_style = f"color: {options.translation_color};"
     if options.translation_style:
+        # --translation_style is the whole declaration block, so it replaces
+        # the colour rather than merging with it. Losing a flag the user
+        # typed is worth a line.
+        if options.translation_color:
+            print(
+                f"[bold yellow]Warning:[/bold yellow] --translation_style "
+                f"replaces --translation_color; the colour "
+                f"{options.translation_color!r} is ignored. Put it in the "
+                f"style instead."
+            )
         e.translation_style = options.translation_style
     if options.batch_size:
         e.batch_size = options.batch_size
@@ -942,32 +1107,14 @@ So you are close to reaching the limit. You have to choose your own value, there
         if not options.api_base:
             raise ValueError("`api_base` must be provided when using `deployment_id`")
         e.translate_model.set_deployment_id(options.deployment_id)
-    # Check the sidecar is up and signed in before parsing a book: a login
-    # prompt after ten minutes of work is the wrong time to find out.
-    if hasattr(e.translate_model, "preflight"):
-        e.translate_model.preflight()
+    # The refusals live at the top of main(); what is left here is the part
+    # that has to talk to the endpoint.
     if options.model in ("openai", "groq"):
-        # Currently only supports `openai` when you also have --model_list set
-        if options.model_list:
-            try:
-                e.translate_model.set_model_list(options.model_list.split(","))
-            except Exception as ex:
-                print(f"[red]Error: {ex}[/red]")
-                exit(1)
-        else:
-            raise ValueError(
-                "When using `openai` model, you must also provide `--model_list`. For default model sets use `--model chatgptapi` or `--model gpt4` or `--model gpt4omini` or `--model gpt5mini`",
-            )
-    elif options.model_list and options.model != "gemini" and not options.provider:
-        # every other --model value runs its own preset model discovery and
-        # would silently drop the explicit model choice — the worst outcome
-        # for a user pointing at a proxy that only serves that model
-        print(
-            f"[bold red]Error: --model_list is only honored by --model openai, "
-            f"groq or gemini (or a --provider); --model {options.model} uses "
-            f"its own preset models and would silently ignore it.[/bold red]"
-        )
-        exit(1)
+        try:
+            e.translate_model.set_model_list(options.model_list.split(","))
+        except Exception as ex:
+            print(f"[red]Error: {ex}[/red]")
+            exit(1)
     # TODO refactor, quick fix for gpt4 model
     if options.model == "chatgptapi":
         if options.ollama_model:
@@ -1023,7 +1170,29 @@ So you are close to reaching the limit. You have to choose your own value, there
                     "Provider has no default_models. Please provide --model_list"
                 )
 
-    e.make_bilingual_book()
+    # Everything that must be settled before the first paid request, now
+    # that the model list is known: the codex sidecar is up and signed in,
+    # and an auto-sized compact budget has a number from the endpoint for
+    # every model in play. A login prompt — or a window nobody can report —
+    # after ten minutes of translating is the wrong time to find out.
+    if hasattr(e.translate_model, "preflight"):
+        try:
+            e.translate_model.preflight()
+        except Exception as err:
+            if not getattr(err, "user_facing", False):
+                raise
+            print(f"[bold red]{escape(str(err))}[/bold red]")
+            exit(1)
+
+    try:
+        e.make_bilingual_book()
+    except PlanLedgerError as err:
+        # The plan JSON is the one file this workflow asks a person (or an
+        # agent) to hand-edit, so its lint errors are the failure a user is
+        # most likely to see — print them like every other plan failure,
+        # not as a traceback.
+        print(f"[bold red]{escape(str(err))}[/bold red]")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
