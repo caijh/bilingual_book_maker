@@ -59,15 +59,9 @@ BATCH_PROMPT = "{text}"
 # threshold is about the user's 5-hour window, not about tokens.
 QUOTA_WARN_PERCENT = 90
 
-# --context-compact-at 0 compacts at 90% of the model's window, leaving room
-# for the tail the thread still has to carry: the fresh paragraph, its
-# translation, and the handoff turn itself.
-
-# The model a codex run translates with when --model_list names none. Naming
-# one keeps that choice here rather than leaving it to whatever the user's
-# codex config happens to default to, and it is the name the window and
-# compaction notices report. It does not decide the compact budget:
-# compact_budget_for() returns the same figure for every model.
+# Used when --model is omitted. Naming one beats letting Codex pick: the
+# compact budget is looked up by model id, so an unknown default would fall
+# back to the conservative 8000 instead of this model's own 17000.
 DEFAULT_MODEL = "gpt-5.6-luna"
 
 # A minute past the reset, because the server's clock and ours are not the
@@ -125,8 +119,6 @@ class Codex(Base):
         self.model_list = None
         self.context_compact_at = context_compact_at
         self.no_context_compact = no_context_compact
-        self._auto_budget = None
-        self._window_notice_shown = False
         self.handoff_path = Path(handoff_path) if handoff_path else None
         self.prompt_sys_msg = prompt_sys_msg
         self.prompt_template = prompt_template
@@ -314,39 +306,7 @@ class Codex(Base):
         """How many estimated tokens a thread may carry before it rolls over."""
         if self.context_compact_at is None:
             return compact_budget_for(self.model)
-        if self.context_compact_at == 0:
-            return self._model_sized_budget()
         return self.context_compact_at
-
-    def _model_sized_budget(self):
-        """0.9 x the window the sidecar reports for the *book's* thread.
-
-        Asked per thread: the question thread plan classification runs on can
-        carry a different model, so a server-wide answer could size the book's
-        window from the classifier's. The sidecar only reports a window once a
-        turn has spent tokens, so a miss is answered with the default and
-        asked again next unit — reading it back is free — while the answer,
-        once it arrives, is kept so the seam does not move under an
-        accumulated thread.
-        """
-        if self._auto_budget is None:
-            window = self._ensure_server().latest_model_context_window(self._thread_id)
-            if window:
-                self._auto_budget = window * 9 // 10
-                print(
-                    f"[cyan]ℹ {self.model} reports a {window}-token context "
-                    f"window; compacting at {self._auto_budget}[/cyan]"
-                )
-        if self._auto_budget is not None:
-            return self._auto_budget
-        if not self._window_notice_shown:
-            self._window_notice_shown = True
-            print(
-                f"[yellow]ℹ the sidecar has not reported a context window for "
-                f"{self.model}; compacting at the default "
-                f"{compact_budget_for(self.model)} until it does[/yellow]"
-            )
-        return compact_budget_for(self.model)
 
     def _compact_window(self):
         """Condense the thread into a handoff report and open the next one.
@@ -438,8 +398,7 @@ class Codex(Base):
         # per-worker buffers to hand out. Letting workers overlap would
         # interleave unrelated chapters into one thread, lose window-token
         # updates to races, and let a compact swap the thread mid-turn.
-        # `--parallel-workers` therefore buys nothing here, which is why the
-        # CLI refuses the pairing rather than letting a run discover it.
+        # `--parallel-workers` therefore buys nothing here, and the CLI says so.
         with self._turn_lock:
             thread_id = self._ensure_thread()
 

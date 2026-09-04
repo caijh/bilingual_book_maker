@@ -1,27 +1,14 @@
-from .chatgptapi_translator import ChatGPTAPI
+"""xAI's endpoint.
 
-XAI_MODEL_LIST = [
-    "grok-beta",
-]
+The OpenAI shape at api.x.ai, so this is the OpenAI route with that address
+and xAI's key variable. See groq_translator for why no model id is named
+here.
+"""
+
+from book_maker.translator.chatgptapi_translator import ChatGPTAPI
+
+XAI_API_BASE = "https://api.x.ai/v1"
 
 
 class XAIClient(ChatGPTAPI):
-    # An OpenAI-shaped gateway: everything ChatGPTAPI can do — context,
-    # session history, structured output, batching — it can do here, so every
-    # argument is forwarded. Only the default address and model differ.
-    def __init__(self, key, language, api_base=None, **kwargs) -> None:
-        super().__init__(
-            key,
-            language,
-            api_base=str(api_base) if api_base else "https://api.x.ai/v1",
-            **kwargs,
-        )
-        self.model_list = XAI_MODEL_LIST
-        self.api_url = self.api_base
-        # known from the start: `preflight` may size a compact budget for
-        # every model in play before any request rotates one in
-        self._model_names = tuple(XAI_MODEL_LIST)
-        self.model = XAI_MODEL_LIST[0]
-
-    def rotate_model(self):
-        self.model = self.model_list[0]
+    DEFAULT_API_BASE = XAI_API_BASE

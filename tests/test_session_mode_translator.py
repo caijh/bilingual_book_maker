@@ -1,4 +1,4 @@
-"""`--use_context session` inside ChatGPTAPI: prefix stability and compact.
+"""`--use_context session` inside ChatGPTAPI: prefix stability and compaction.
 
 Window mode's regression tests live in test_chatgptapi_translator.py; the ones
 here are about the new mode, and above all about the invariant that pays for
@@ -14,12 +14,11 @@ from unittest.mock import Mock
 
 import pytest
 
+from book_maker.session_context import handoff_prompt
 from openai import LengthFinishReasonError
 
-from book_maker.session_context import DEFAULT_COMPACT_BUDGET, handoff_prompt
 from book_maker.translator.chatgptapi_translator import (
     ChatGPTAPI,
-    ContextWindowUnknown,
     batch_field_name,
     single_field_name,
 )
@@ -67,19 +66,18 @@ def _parsed_completion(content, cached_tokens=None):
     )
 
 
-def _translator(replies=None, verdict=False, cached_tokens=None, **kwargs):
+def _translator(replies=None, verdict="unsupported", cached_tokens=None, **kwargs):
     """A ChatGPTAPI wired to a scripted client. No network, real __init__.
 
-    `verdict` picks the path under test: the default forces the plain
-    (delimiter) path, since most of these tests are about the session history
-    rather than structured outputs. `"strict"` sends translation through
-    Structured Outputs — the path a strict endpoint really uses.
+    `verdict` picks the path under test: the default sends every translation
+    down the plain path, `"strict"` sends it through Structured Outputs — the
+    path session mode actually uses.
     """
     kwargs.setdefault("context_flag", True)
     kwargs.setdefault("context_mode", "session")
     t = ChatGPTAPI(key="k", language="Chinese", **kwargs)
     t.model = "test-model"
-    t._structured_support["test-model"] = verdict
+    t.capabilities.record("test-model", verdict)
 
     sent = []
     answers = iter(replies or [])
@@ -113,6 +111,19 @@ def _translator(replies=None, verdict=False, cached_tokens=None, **kwargs):
 def _prefix(call):
     """Everything but the final (fresh) user message."""
     return call["messages"][:-1]
+
+
+def _tail_containing(translator, needle):
+    """The tail message of the last request that carried `needle`.
+
+    With a tiny compact budget a compact request follows every unit, so the
+    last request is not the last *translation* — say which one is meant.
+    """
+    for call in reversed(translator.sent):
+        content = call["messages"][-1]["content"]
+        if needle in content:
+            return content
+    raise AssertionError(f"no request carried {needle!r}")
 
 
 class TestSessionHistoryGrows:
@@ -321,12 +332,14 @@ class TestWindowModeUnchanged:
         assert len(_prefix(t.sent[-1])) == 3
 
 
-class TestParallelIsolation:
-    """Each parallel worker needs its own history.
+class TestOneHistoryPerRun:
+    """A session run has exactly one history, and it is never cloned.
 
-    A shared SessionHistory would be appended to from several threads at
-    once, interleaving chapters into one list and destroying the very
-    prefix stability the mode exists for.
+    Several workers cannot share one — chapters would interleave and the
+    prefix stability the mode exists for would be gone — and a fresh
+    history per chapter is window mode at session prices. So the pairing
+    is refused on the command line (see tests/test_cli.py) and the loader
+    only ever hands out the shared instance.
     """
 
     def _loader(self, tmp_path, workers):
@@ -347,21 +360,6 @@ class TestParallelIsolation:
             context_mode="session",
             parallel_workers=workers,
         )
-
-    def test_each_parallel_clone_gets_its_own_history(self, tmp_path):
-        loader = self._loader(tmp_path, workers=2)
-        loader.translate_model.session.append("chapter one", "第一章")
-        first = loader._clone_translator_for_context()
-        second = loader._clone_translator_for_context()
-        assert first.session is not second.session
-        assert first.session is not loader.translate_model.session
-        assert first.session.messages() == []
-
-    def test_a_clone_does_not_write_into_the_shared_history(self, tmp_path):
-        loader = self._loader(tmp_path, workers=2)
-        clone = loader._clone_translator_for_context()
-        clone.session.append("worker text", "译文")
-        assert loader.translate_model.session.messages() == []
 
     def test_sequential_runs_keep_the_shared_history(self, tmp_path):
         loader = self._loader(tmp_path, workers=1)
@@ -564,208 +562,3 @@ class TestCompactionDisabled:
         assert any(
             HANDOFF_MARKER in call["messages"][-1]["content"] for call in t.sent
         ), "a positive budget must still ask for the handoff report"
-
-
-class TestAutoCompactBudget:
-    """`--context-compact-at 0`: size the budget from the model's own window."""
-
-    def _with_model(self, model_object, **kw):
-        kw.setdefault("context_compact_at", 0)
-        t = _translator(["译文"] * 40, **kw)
-        t.openai_client.models = SimpleNamespace(
-            retrieve=Mock(
-                side_effect=(
-                    model_object
-                    if callable(model_object)
-                    else lambda *a, **k: model_object
-                )
-            )
-        )
-        return t
-
-    def test_it_takes_nine_tenths_of_the_reported_window(self, capsys):
-        t = self._with_model(SimpleNamespace(id="test-model", context_length=10_000))
-        assert t._session_budget() == 9_000
-        assert "10000" in capsys.readouterr().out
-
-    def test_an_endpoint_reporting_no_window_stops_the_run(self):
-        # `0` asked for the endpoint's number. Falling back to the default
-        # would be a guess about the one model nobody could size, which is
-        # what passing `0` was meant to avoid.
-        t = self._with_model(SimpleNamespace(id="test-model"))
-        with pytest.raises(ContextWindowUnknown) as stop:
-            t._session_budget()
-        message = str(stop.value)
-        assert "--context-compact-at 0" in message
-        assert "test-model" in message
-        assert "8000" in message, "it must say what to pass instead"
-
-    def test_a_lookup_that_never_answers_stops_the_run(self):
-        def boom(*a, **k):
-            raise RuntimeError("connection reset")
-
-        t = self._with_model(boom)
-        with pytest.raises(ContextWindowUnknown) as stop:
-            t._session_budget()
-        assert "could not be asked" in str(stop.value)
-
-    def test_a_number_needs_no_lookup_at_all(self):
-        t = self._with_model(SimpleNamespace(id="test-model"), context_compact_at=600)
-        t.preflight()
-        assert t._session_budget() == 600
-        assert t.openai_client.models.retrieve.call_count == 0
-
-    def test_preflight_asks_before_anything_is_translated(self):
-        t = self._with_model(SimpleNamespace(id="test-model", context_length=10_000))
-        t.preflight()
-        assert t.openai_client.models.retrieve.call_count == 1
-        assert not t.sent, "preflight must not send a translation request"
-
-    def test_preflight_is_where_an_unanswerable_endpoint_is_caught(self):
-        t = self._with_model(SimpleNamespace(id="test-model"))
-        with pytest.raises(ContextWindowUnknown):
-            t.preflight()
-        assert not t.sent, "nothing may be paid for before the refusal"
-
-    def test_the_window_is_looked_up_once(self):
-        t = self._with_model(SimpleNamespace(id="test-model", context_length=10_000))
-        for _ in range(3):
-            t._session_budget()
-        assert t.openai_client.models.retrieve.call_count == 1
-
-
-class TestAutoBudgetAcrossModels:
-    """`--model_list` rotates models; the budget has to survive the smallest."""
-
-    def _with_windows(self, windows):
-        """`windows`: model name -> what `models.retrieve` answers with."""
-        t = _translator(["译文"] * 40, context_compact_at=0)
-
-        def retrieve(model):
-            answer = windows[model]
-            if isinstance(answer, Exception):
-                raise answer
-            return answer
-
-        t.openai_client.models = SimpleNamespace(retrieve=Mock(side_effect=retrieve))
-        return t
-
-    def test_it_takes_the_smallest_window_in_play(self):
-        t = self._with_windows(
-            {
-                "big": SimpleNamespace(id="big", context_length=100_000),
-                "small": SimpleNamespace(id="small", context_length=10_000),
-            }
-        )
-        t.model = "big"
-        assert t._session_budget() == 90_000
-        t.model = "small"
-        assert t._session_budget() == 9_000, "a smaller model must shrink the budget"
-
-    def test_every_configured_model_is_measured_before_the_seam(self):
-        """A smaller model must not first be discovered by failing on it."""
-        t = self._with_windows(
-            {
-                "big": SimpleNamespace(id="big", context_length=100_000),
-                "small": SimpleNamespace(id="small", context_length=10_000),
-            }
-        )
-        t._model_names = ["big", "small"]
-        t.model = "big"
-        assert t._session_budget() == 9_000, "the smaller model was not measured"
-
-    def test_one_unmeasurable_model_stops_the_whole_run(self):
-        from openai import NotFoundError
-
-        missing = NotFoundError(
-            "no such model", response=Mock(status_code=404, headers={}), body=None
-        )
-        t = self._with_windows(
-            {
-                "big": SimpleNamespace(id="big", context_length=100_000),
-                "mystery": missing,
-            }
-        )
-        t._model_names = ["big", "mystery"]
-        t.model = "big"
-        # The unknown model may be the smallest of them, and the history is
-        # shared, so there is no budget here that is not a guess.
-        with pytest.raises(ContextWindowUnknown) as stop:
-            t._session_budget()
-        assert "mystery" in str(stop.value)
-
-    def test_each_model_is_looked_up_once(self):
-        t = self._with_windows(
-            {"a": SimpleNamespace(id="a", context_length=10_000)},
-        )
-        t.model = "a"
-        for _ in range(3):
-            t._session_budget()
-        assert t.openai_client.models.retrieve.call_count == 1
-
-    def test_a_transient_failure_is_retried_before_it_becomes_fatal(self):
-        answers = [
-            RuntimeError("connection reset"),
-            SimpleNamespace(id="a", context_length=10_000),
-        ]
-
-        def retrieve(model):
-            answer = answers.pop(0)
-            if isinstance(answer, Exception):
-                raise answer
-            return answer
-
-        t = self._with_windows({})
-        t.openai_client.models.retrieve = Mock(side_effect=retrieve)
-        t.model = "a"
-        assert t._session_budget() == 9_000, "one blip must not end the run"
-
-    def test_it_stops_asking_a_hopeless_endpoint_and_then_refuses(self):
-        t = self._with_windows({"a": RuntimeError("connection reset")})
-        t.model = "a"
-        with pytest.raises(ContextWindowUnknown):
-            t._session_budget()
-        assert t.openai_client.models.retrieve.call_count <= 3
-
-    def test_a_missing_model_is_settled_not_retried(self):
-        from openai import NotFoundError
-
-        error = NotFoundError(
-            "no such model", response=Mock(status_code=404, headers={}), body=None
-        )
-        t = self._with_windows({"a": error})
-        t.model = "a"
-        with pytest.raises(ContextWindowUnknown) as stop:
-            t._session_budget()
-        assert "no record of" in str(stop.value)
-        assert t.openai_client.models.retrieve.call_count == 1
-
-
-class TestReportedWindowIsChecked:
-    """A number off the wire decides how much context a run carries."""
-
-    def _budget_for(self, model_object):
-        t = _translator(["译文"], context_compact_at=0)
-        t.openai_client.models = SimpleNamespace(
-            retrieve=Mock(return_value=model_object)
-        )
-        return t._session_budget()
-
-    def _refused(self, model_object):
-        """A record with nothing usable in it is a record with no window."""
-        with pytest.raises(ContextWindowUnknown) as stop:
-            self._budget_for(model_object)
-        assert "no usable one" in str(stop.value)
-
-    def test_a_boolean_is_not_a_window(self):
-        # `True` is an int in Python, and 0.9 * True is 0 — no rollover at all.
-        self._refused(SimpleNamespace(id="m", context_length=True))
-
-    def test_a_window_too_small_to_hold_a_paragraph_is_refused(self):
-        self._refused(SimpleNamespace(id="m", context_length=100))
-
-    def test_an_absurd_window_is_refused(self):
-        self._refused(SimpleNamespace(id="m", context_length=10**30))
-
-    def test_a_string_is_refused(self):
-        self._refused(SimpleNamespace(id="m", context_length="128000"))
