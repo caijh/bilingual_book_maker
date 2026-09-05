@@ -6,6 +6,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from rich import print
+from rich.markup import escape
+
+from ..redaction import redact, remember
 
 from ..structured import (
     extract_json_object,
@@ -204,6 +207,23 @@ class BatchTranslationResult:
     context: TranslationContext
 
 
+def service_name(translator):
+    """The `--api_format` or `--provider` key a translator is registered
+    under, or its class name for one registered nowhere.
+
+    Imported lazily: the registries live in the package `__init__`, which
+    imports every translator, which imports this module.
+    """
+    from . import FORMAT_DICT, ROUTE_DICT
+
+    cls = type(translator)
+    for registry in (FORMAT_DICT, ROUTE_DICT):
+        for key, registered in registry.items():
+            if registered is cls:
+                return key
+    return cls.__name__
+
+
 class Base(ABC):
     # Default values for fatal error handling - subclasses can override
     TRANSLATION_ERROR_MARKER = None
@@ -242,10 +262,57 @@ class Base(ABC):
     # translator, so accepting it would be an AttributeError partway in.
     SUPPORTS_BATCH_API = False
 
+    # Does this route carry --extra_body / --extra_headers? True where the
+    # request is built here from an SDK that takes them. The codex route is
+    # a subprocess with no request to merge into, and the fixed-endpoint MT
+    # services speak their own protocol; both refuse the flags rather than
+    # printing success and dropping the fields.
+    SUPPORTS_REQUEST_EXTRAS = False
+
+    def set_request_extras(self, extra_body=None, extra_headers=None):
+        """Fields and headers to add to every request this route makes.
+
+        Overridden where `SUPPORTS_REQUEST_EXTRAS` is True. The base refuses
+        rather than storing attributes nothing reads.
+        """
+        raise NotImplementedError(
+            f"the {service_name(self)} route builds no request these could "
+            f"be added to"
+        )
+
+    # --extra_body / --extra_headers, rebound by `set_request_extras` and
+    # never mutated in place. Class-level so a route that skipped __init__
+    # still answers, and so the default is stated once.
+    extra_body = {}
+    extra_headers = {}
+
+    def warn_if_extras_refused(self, error):
+        """Say so when a request carrying the run's extras was refused.
+
+        The structured ladder answers a refusal by demoting to the next rung
+        and carrying on, which is right when the endpoint simply does not do
+        schemas — and wrong when the operator's own `--extra_body` or
+        `--extra_headers` is what the endpoint objected to, because then the
+        run degrades quietly and the endpoint's own words are never seen.
+        """
+        if not (self.extra_body or self.extra_headers):
+            return
+        message = redact(error)
+        print(
+            f"[bold yellow]Warning:[/bold yellow] the endpoint refused a "
+            f"request carrying your --extra_body/--extra_headers, and the "
+            f"run fell back to a simpler request shape. It said: "
+            f"{escape(message)}"
+        )
+
     # Refusals of one rung, by one model, before we stop offering it.
     RUNG_REFUSAL_THRESHOLD = 2
 
     def __init__(self, key, language) -> None:
+        # Registered before the first request: an endpoint that refuses a key
+        # routinely quotes it back, and this run prints an endpoint's words
+        # in several places.
+        remember(*key.split(","))
         self.keys = itertools.cycle(key.split(","))
         self.language = language
         self._fatal_error_detected = False
@@ -257,6 +324,20 @@ class Base(ABC):
         # Filled by the translators that get usage back from the endpoint;
         # the loader reads it for the progress bar and the closing line.
         self.usage = UsageMeter()
+
+    @property
+    def model_name(self):
+        """The model id this translator runs with, for the record an output
+        file keeps of how it was made.
+
+        Every LLM translator here settles on `self.model` — the endpoint
+        needs a model id to call, so the attribute is not optional for
+        them. The ones that call a single fixed service (Google, DeepL,
+        Caiyun, TranSmart) have no model to name, and the name the service
+        is selected by — its `--api_format` or `--provider` key — is the
+        honest answer: it says which service, and claims no more.
+        """
+        return getattr(self, "model", None) or service_name(self)
 
     def usage_postfix(self):
         return self.usage.postfix()

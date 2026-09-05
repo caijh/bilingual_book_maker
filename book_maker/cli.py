@@ -19,8 +19,8 @@ from book_maker.translator import (
     LLM_FORMATS,
     ROUTE_DICT,
 )
+from book_maker.redaction import redact
 from book_maker.translator.base_translator import PriceTable
-from book_maker.translator.chatgptapi_translator import ChatGPTAPI
 from book_maker.translator.capabilities import ModelUnavailable
 from book_maker.utils import LANGUAGES, TO_LANGUAGE_CODE
 
@@ -81,13 +81,9 @@ DEFAULT_MODELS = {
 MODEL_EXAMPLES = {
     "anthropic": "claude-sonnet-4-6",
     "groq": "llama-3.3-70b-versatile",
-    "xai": "grok-beta",
+    "xai": "grok-4.3",
     "litellm": "<the model_name in your proxy's config>",
 }
-
-# `--model codex` selects the format rather than a model id. The sidecar then
-# picks its own default, exactly as `--api_format codex` with no --model does.
-CODEX_MODEL_ALIASES = ("codex",)
 
 
 def infer_api_format(api_base, model=""):
@@ -99,9 +95,6 @@ def infer_api_format(api_base, model=""):
     overrides both.
     """
     name = (model or "").strip().lower()
-    # `codex` is a sidecar, not an endpoint, so no --api_base can imply it.
-    if name in CODEX_MODEL_ALIASES:
-        return "codex"
     if api_base:
         host = (urlparse(api_base).hostname or "").lower()
         official = host == "anthropic.com" or host.endswith(".anthropic.com")
@@ -225,7 +218,16 @@ def apply_provider(options):
     options.price_table = (
         PriceTable(route.prices, route.currency) if route.prices else None
     )
-    if route.models and not options.model and not options.model_list:
+    # The codex sidecar is not the entry's HTTP endpoint: it ignores the
+    # entry's base and key and resolves its own default model, so a provider's
+    # model list is not its to take. On that route a model comes only from an
+    # explicit --model/--model_list.
+    if (
+        route.models
+        and not options.model
+        and not options.model_list
+        and options.api_format != "codex"
+    ):
         # One model belongs in --model; several rotate, first one first.
         if len(route.models) == 1:
             options.model = route.models[0]
@@ -274,11 +276,15 @@ def resolve_endpoint(options):
     if len(model_names) == 1 and model_names[0].lower() in ROUTE_DICT:
         options.api_base = normalize_api_base(options.api_base, "openai")
         return [model_names[0].lower()], "openai", ("BBM_ORCAROUTER_API_KEY",)
-    if model_names and model_names[0].lower() in CODEX_MODEL_ALIASES:
-        # settled from the route itself, so the provider's api_style
-        # cannot answer a question the model name already answered
-        options.api_format = options.api_format or infer_api_format(
-            options.api_base, model_names[0]
+    # `--model codex` is rewritten to `--api_format codex` by the legacy shim;
+    # `--model_list` is not, so a bare `codex` here came from --model_list and
+    # names the route, not a model to rotate to. Say what to type instead of
+    # sending `codex` on as a model id the endpoint will refuse.
+    listed = [n.strip() for n in (options.model_list or "").split(",") if n.strip()]
+    if len(listed) == 1 and listed[0].lower() == "codex":
+        raise SystemExit(
+            "--model_list codex names the codex route, not a model. Use "
+            "--api_format codex instead, and --model only to name a model on it."
         )
 
     provider_env_keys = apply_provider(options)
@@ -474,7 +480,7 @@ def resolve_plan_mode(book_type, api_format, translate_tags_given, probe):
     except Exception as e:
         # tag mode still works; the endpoint's trouble surfaces at the first
         # translation request
-        return "none", f"the JSON-schema probe failed: {e}"
+        return "none", f"the JSON-schema probe failed: {redact(e)}"
     if verdict != "strict":
         return "none", (
             f"the endpoint does not verify a strict JSON schema "
@@ -492,20 +498,6 @@ def build_parser():
         dest="book_name",
         type=str,
         help="path of the book/source file to be translated",
-    )
-    parser.add_argument(
-        "--book_from",
-        dest="book_from",
-        type=str,
-        choices=["kobo"],  # support kindle later
-        metavar="E-READER",
-        help="e-reader type, available: {%(choices)s}",
-    )
-    parser.add_argument(
-        "--device_path",
-        dest="device_path",
-        type=str,
-        help="Path of e-reader device",
     )
     ########## ENDPOINT ##########
     parser.add_argument(
@@ -540,11 +532,11 @@ def build_parser():
         default=None,
         metavar="MODEL",
         help="model id, exactly as the endpoint names it (e.g. gpt-5-mini, "
-        "claude-sonnet-4-6, or a namespaced openai/gpt-5-mini). Two values "
-        "name a route instead of a model: 'codex' translates on a ChatGPT "
-        "subscription through the Codex CLI, and 'orcarouter' sends the run "
-        "to the OrcaRouter gateway. Old alias values are translated to their "
-        "model with a note. Defaults to gpt-5.6-luna on the openai format; "
+        "claude-sonnet-4-6, or a namespaced openai/gpt-5-mini). One value "
+        "names a route instead of a model: 'orcarouter' sends the run to the "
+        "OrcaRouter gateway. Old alias values, 'codex' among them, are "
+        "translated to their format or model with a note; prefer "
+        "'--api_format codex'. Defaults to gpt-5.6-luna on the openai format; "
         "the anthropic format needs an id",
     )
     parser.add_argument(
@@ -769,6 +761,12 @@ So you are close to reaching the limit. You have to choose your own value, there
         help="translate sentence by sentence within each paragraph instead of the whole paragraph at once",
     )
     parser.add_argument(
+        "--no_disclosure",
+        dest="disclosure",
+        action="store_false",
+        help="do not mark the epub as a machine translation (translator credit, description line and the closing translation note); the model id is recorded verbatim",
+    )
+    parser.add_argument(
         "--use_context",
         dest="context_mode",
         nargs="?",
@@ -875,7 +873,25 @@ So you are close to reaching the limit. You have to choose your own value, there
         dest="extra_body",
         type=str,
         default="",
-        help='JSON string of extra body parameters to pass to the API. Example: --extra_body \'{"chat_template_kwargs": {"enable_thinking": false}}\'',
+        help="JSON object of extra fields to add to every request body, on "
+        "the openai and anthropic routes. It reaches the capability probe "
+        "and the JSON rungs as well as the translate calls, so the endpoint "
+        "is graded on the request the run actually makes. Merged over the "
+        "named parameters, so a field here beats the flag for it (a "
+        "temperature in --extra_body beats --temperature). Examples: "
+        '\'{"chat_template_kwargs": {"enable_thinking": false}}\' on the '
+        'openai route, \'{"thinking": {"type": "disabled"}}\' on anthropic',
+    )
+    parser.add_argument(
+        "--extra_headers",
+        dest="extra_headers",
+        type=str,
+        default="",
+        help="JSON object of extra HTTP headers to send with every request, "
+        "on the openai and anthropic routes. Set on the client, so the "
+        "capability probe, the model check and the model listing carry them "
+        "too. Example: --extra_headers "
+        '\'{"HTTP-Referer": "https://example.com", "X-Title": "bbm"}\'',
     )
     parser.add_argument(
         "--quiet",
@@ -909,17 +925,6 @@ def main():
     if options.plan_classify == "most":
         print("[yellow]--plan-classify most is now --plan-classify all[/yellow]")
         options.plan_classify = "all"
-
-    # Kobo mode supplies the source book itself. Resolve it before validating
-    # --book_name so users do not need a meaningless placeholder file.
-    if options.book_from == "kobo":
-        from book_maker import obok
-
-        if options.device_path is None:
-            raise Exception(
-                "Device path is not given, please specify the path by --device_path <DEVICE_PATH>",
-            )
-        options.book_name = obok.cli_main(options.device_path)
 
     if not options.book_name:
         print("Error: please provide the path of your book using --book_name <path>")
@@ -1126,6 +1131,13 @@ def main():
         )
     if book_type == "pdf":
         loader_kwargs["pdf_layout"] = options.pdf_layout
+    if book_type == "epub":
+        loader_kwargs["disclose"] = options.disclosure
+    elif not options.disclosure:
+        print(
+            "[bold yellow]Warning:[/bold yellow] --no_disclosure is ignored for "
+            f"{book_type} books; only epub output carries the translation note."
+        )
 
     e = book_loader(
         options.book_name,
@@ -1149,26 +1161,80 @@ def main():
     if price_table is not None and hasattr(e.translate_model, "usage"):
         # the bar shows what was spent instead of token counts
         e.translate_model.usage.prices = price_table
-    # Parse and set extra_body only on request paths that consume it. Setting
-    # an arbitrary attribute on the other translators used to print success
-    # and then silently drop the fields.
-    if options.extra_body:
-        # The OpenAI request path is what reads it, so every route built on
-        # that path takes it — naming the format instead would have told a
-        # groq or xai run that its fields were dropped when they were not.
-        if not issubclass(translate_model, ChatGPTAPI):
+    # Request extras, on the routes that build a request these can join.
+    # Setting an arbitrary attribute on the others used to print success and
+    # then silently drop the fields.
+    if options.extra_body or options.extra_headers:
+        given = [
+            flag
+            for flag, value in (
+                ("--extra_body", options.extra_body),
+                ("--extra_headers", options.extra_headers),
+            )
+            if value
+        ]
+        if not translate_model.SUPPORTS_REQUEST_EXTRAS:
+            # Named by capability, not by format: `groq`, `xai`, `litellm`
+            # and `orcarouter` are the openai request path and do take them,
+            # and naming the format would have told those runs otherwise.
             print(
-                f"[bold yellow]Warning:[/bold yellow] --extra_body is ignored "
-                f"by the {api_format} route"
+                f"[bold yellow]Warning:[/bold yellow] "
+                f"{' and '.join(given)} "
+                f"{'is' if len(given) == 1 else 'are'} ignored by the "
+                f"{api_format} route, which builds no request they could "
+                f"join; the run continues without them."
             )
         else:
-            try:
-                extra_body = json.loads(options.extra_body)
-                e.translate_model.extra_body = extra_body
-                print(f"[bold blue]Extra body parameters:[/bold blue] {extra_body}")
-            except json.JSONDecodeError as ex:
-                print(f"[bold red]Error:[/bold red] Invalid JSON in --extra_body: {ex}")
+            extras = {}
+            for flag, dest in (
+                ("--extra_body", "extra_body"),
+                ("--extra_headers", "extra_headers"),
+            ):
+                raw = getattr(options, dest)
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError as ex:
+                    print(f"[bold red]Error:[/bold red] invalid JSON in {flag}: {ex}")
+                    exit(1)
+                if not isinstance(parsed, dict):
+                    # A list or a bare string would be accepted by the SDK
+                    # and rejected by the endpoint, one paid request later.
+                    print(
+                        f"[bold red]Error:[/bold red] {flag} must be a JSON "
+                        f"object, not {type(parsed).__name__}."
+                    )
+                    exit(1)
+                extras[dest] = parsed
+            if "extra_headers" in extras and not all(
+                isinstance(v, str) for v in extras["extra_headers"].values()
+            ):
+                # httpx raises on a non-string header value, deep in the
+                # first request rather than here.
+                print(
+                    "[bold red]Error:[/bold red] --extra_headers values must "
+                    "all be strings."
+                )
                 exit(1)
+            e.translate_model.set_request_extras(**extras)
+            if "extra_body" in extras:
+                # Through redact(): a body field is not where a credential
+                # belongs, but a gateway that wants the key in the body gets
+                # it repeated here, and the echo must not print it either.
+                print(
+                    f"[bold blue]--extra_body:[/bold blue] "
+                    f"{escape(redact(str(extras['extra_body'])))}"
+                )
+            if "extra_headers" in extras:
+                # Names only. A header is where a credential goes —
+                # Authorization, X-API-Key — and echoing the value would put
+                # it in every log and CI artifact the run touches.
+                names = ", ".join(sorted(extras["extra_headers"]))
+                print(
+                    f"[bold blue]--extra_headers:[/bold blue] {escape(names)} "
+                    f"(values not shown)"
+                )
     # other options
     if options.sentence_mode:
         e.sentence_mode = True
@@ -1301,7 +1367,7 @@ def main():
             except Exception as err:
                 if not getattr(err, "user_facing", False):
                     raise
-                print(f"[bold red]{escape(str(err))}[/bold red]")
+                print(f"[bold red]{escape(redact(err))}[/bold red]")
                 exit(1)
     elif model_names:
         # These formats translate through a fixed engine and take no model, so
@@ -1332,7 +1398,7 @@ def main():
             # message is the whole explanation
             if not getattr(err, "user_facing", False):
                 raise
-            print(f"[bold red]{escape(str(err))}[/bold red]")
+            print(f"[bold red]{escape(redact(err))}[/bold red]")
             exit(1)
         if mode == "model":
             print(f"plan mode: on ({reason})")
@@ -1351,7 +1417,7 @@ def main():
         # agent) to hand-edit, so its lint errors are the failure a user is
         # most likely to see — print them like every other plan failure,
         # not as a traceback.
-        print(f"[bold red]{escape(str(err))}[/bold red]")
+        print(f"[bold red]{escape(redact(err))}[/bold red]")
         raise SystemExit(1)
 
 

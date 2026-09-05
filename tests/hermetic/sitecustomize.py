@@ -14,8 +14,32 @@ is explicitly about talking to real providers.
 """
 
 import os
+import sys
+from pathlib import Path
 
+# The checkout this file belongs to, ahead of everything else. `sitecustomize`
+# is imported during interpreter startup, before the script's own directory is
+# on `sys.path`, so a plain `import book_maker` here resolves against whatever
+# is installed site-wide. With a stale `pip install -e` in the environment that
+# is somebody else's checkout: the CLI subprocess then runs *that* code, and a
+# test asserting this branch's behaviour fails — or worse, passes — for reasons
+# nothing in the branch explains. Seen 260903, a whole worktree tested against
+# another one's translator.
+_REPO = Path(__file__).resolve().parent.parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+import book_maker
 from book_maker.translator import FORMAT_DICT, ROUTE_DICT
+
+if not Path(book_maker.__file__).resolve().is_relative_to(_REPO):
+    # `site` imports this file inside `except Exception`, so raising here is
+    # printed and swallowed and the run continues against the wrong code.
+    # Leave by a door that cannot be caught.
+    sys.stderr.write(
+        f"hermetic harness loaded {book_maker.__file__}, outside {_REPO}\n"
+    )
+    os._exit(1)
 
 
 class OfflineTranslator:
@@ -33,14 +57,36 @@ class OfflineTranslator:
     # it has none of the Batch API methods, and the CLI's refusal of --batch
     # on a route without them is part of the contract these tests exercise
     SUPPORTS_BATCH_API = False
+    # It builds no request, like the real `google` engine it stands in for,
+    # so --extra_body / --extra_headers have nothing to join. The CLI's
+    # refusal of them on such a route is part of the contract these tests
+    # exercise.
+    SUPPORTS_REQUEST_EXTRAS = False
     context_paragraph_limit = 3
 
     def __init__(self, *args, **kwargs):
         self._fatal_error_detected = False
         self.is_test = False
+        # As Base.__init__ does: the key is a secret from the moment the
+        # translator holds it, and every sink the CLI prints goes through
+        # redact(); a stand-in that skipped this would let a CLI test pass
+        # while the real run printed the key.
+        from book_maker.redaction import remember
+
+        key = kwargs.get("key", args[0] if args else None)
+        if key:
+            remember(*str(key).split(","))
 
     def rotate_key(self):
         pass
+
+    @property
+    def model_name(self):
+        # the same answer the real translators give: the model, else the
+        # api_format / provider key this stand-in is registered under
+        from book_maker.translator.base_translator import service_name
+
+        return getattr(self, "model", None) or service_name(self)
 
     def set_model_list(self, model_list=(), *args, **kwargs):
         # echoed so a CLI test can see which models the run selected —
@@ -79,6 +125,22 @@ class OfflineLLM(OfflineTranslator):
                 "This endpoint served none of the models ['ghost-model']."
             )
         return verdict
+
+    # An SDK-backed request, like the openai route this stands in for.
+    SUPPORTS_REQUEST_EXTRAS = True
+
+    def set_request_extras(self, extra_body=None, extra_headers=None):
+        # echoed so a CLI test can see what the run would have sent — header
+        # names only, for the reason the CLI redacts them: a header is where
+        # a credential goes, and a test log is still a log
+        from book_maker.redaction import redact, remember
+
+        remember(*(extra_headers or {}).values())
+        names = sorted(extra_headers or {})
+        print(
+            f"offline extras: body={redact(str(extra_body or {}))} "
+            f"header names={names}"
+        )
 
     def supports_structured_json(self):
         return True

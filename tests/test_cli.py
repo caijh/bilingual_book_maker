@@ -13,7 +13,7 @@ import pytest
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -370,6 +370,42 @@ def test_a_local_endpoint_needs_no_key(tmp_path, monkeypatch):
     assert resolve_api_key("openai", "", "http://localhost:11434/v1") == "local"
 
 
+def test_api_format_codex_needs_no_model(tmp_path):
+    # The skill and the README spell this route `--api_format codex`, with no
+    # --model: the sidecar picks its own default. If codex ever falls out of
+    # MODEL_OPTIONAL_FORMATS the run dies at the model gate instead, before
+    # anything codex-shaped is even tried.
+    #
+    # PATH is emptied so the sidecar cannot start: the run must get far
+    # enough to look for the binary, and no further. A machine with codex
+    # installed and signed in would otherwise spend the user's plan here.
+    src = tmp_path / BOOK.name
+    src.write_bytes(BOOK.read_bytes())
+    env = _env()
+    env["PATH"] = str(tmp_path / "no-binaries-here")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "make_book.py",
+            "--book_name",
+            str(src),
+            "--api_format",
+            "codex",
+        ],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    out = proc.stdout + proc.stderr
+    assert "--model is required" not in out
+    # and the missing binary is the one line it was written as, not a
+    # traceback: preflight exists to say this before any paid request
+    assert "Install the Codex CLI" in out
+    assert "Traceback" not in out
+    assert proc.returncode == 1
+
+
 def test_parallel_workers_is_refused_with_codex(tmp_path):
     # codex serializes every turn on one thread, and the parallel path then
     # reads a context attribute Codex does not have — an AttributeError that
@@ -454,30 +490,6 @@ def test_quiet_flag_is_accepted(tmp_path):
     proc, plan = _run(tmp_path, "--plan-dry-run", "--quiet")
     assert proc.returncode == 0
     assert plan.exists()
-
-
-def test_kobo_mode_does_not_require_book_name(tmp_path, monkeypatch):
-    src = tmp_path / BOOK.name
-    src.write_bytes(BOOK.read_bytes())
-    fake_obok = ModuleType("book_maker.obok")
-    fake_obok.cli_main = lambda device_path: str(src)
-    monkeypatch.setitem(sys.modules, "book_maker.obok", fake_obok)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "make_book.py",
-            "--book_from",
-            "kobo",
-            "--device_path",
-            "/mounted/kobo",
-            "--plan-dry-run",
-        ],
-    )
-
-    main()
-
-    assert (tmp_path / f"{src.stem}_plan.json").exists()
 
 
 def test_prompt_json_accepts_a_style_field():
@@ -755,7 +767,7 @@ class TestVendorFormats:
         "fmt,example",
         [
             ("groq", "llama-3.3-70b-versatile"),
-            ("xai", "grok-beta"),
+            ("xai", "grok-4.3"),
             ("anthropic", "claude-sonnet-4-6"),
         ],
     )
@@ -782,7 +794,7 @@ class TestVendorFormats:
         from book_maker.cli import resolve_endpoint
 
         provider_entry(api_style="groq", env_key="BBM_TEST_PROVIDER_KEY")
-        options = _options(provider="p", api_format="xai", model="grok-beta")
+        options = _options(provider="p", api_format="xai", model="grok-4.3")
         _, api_format, env_keys = resolve_endpoint(options)
 
         assert api_format == "xai"
@@ -978,11 +990,19 @@ class TestProviderPrecedence:
             base_url="https://api.provider.example/v1",
             default_models=["model-one"],
         )
-        options = _options(provider="p", model="codex")
+        from book_maker.legacy_cli import translate_legacy_argv
+
+        legacy = translate_legacy_argv(["--provider", "p", "--model", "codex"])
+        assert "--model codex is now --api_format codex" in legacy.notices
+        assert "--model" not in legacy.argv  # the alias is gone, not a model id
+
+        options = _options(provider="p", api_format="codex")
         models, api_format, _ = resolve_endpoint(options)
 
         assert api_format == "codex"
-        assert models == ["codex"]
+        # the sidecar resolves its own default; the entry's HTTP model is not
+        # its to take, or the run would send `model-one` to codex
+        assert "model-one" not in models
 
     def test_model_orcarouter_keeps_its_own_gateway_at_a_provider(self, provider_entry):
         # the OrcaRouter key would otherwise be sent to the provider's base;
@@ -1433,3 +1453,166 @@ def test_the_dry_run_builds_no_translator_at_all(tmp_path, monkeypatch):
     main()
 
     assert (tmp_path / f"{src.stem}_plan.json").exists()
+
+
+class TestRequestExtrasFlags:
+    """`--extra_body` / `--extra_headers`: refused early, or carried."""
+
+    def _cli_extras(self, tmp_path, *args):
+        src = tmp_path / BOOK.name
+        src.write_bytes(BOOK.read_bytes())
+        return _cli(
+            "--book_name",
+            str(src),
+            "--key",
+            "sk-test",
+            "--api_format",
+            "openai",
+            "--model",
+            "m",
+            "--test",
+            "--test_num",
+            "1",
+            *args,
+        )
+
+    def test_invalid_json_names_the_flag_it_came_from(self, tmp_path):
+        # with both flags taking JSON, "invalid JSON" alone leaves the reader
+        # checking the wrong one
+        proc = self._cli_extras(tmp_path, "--extra_headers", "{nope}")
+        output = " ".join((proc.stdout + proc.stderr).split())
+
+        assert proc.returncode != 0
+        assert "invalid JSON in --extra_headers" in output
+
+    def test_a_json_array_is_refused_before_a_paid_request(self, tmp_path):
+        # the SDK would accept it and the endpoint would reject it, one
+        # billed request later
+        proc = self._cli_extras(tmp_path, "--extra_body", '["a"]')
+        output = " ".join((proc.stdout + proc.stderr).split())
+
+        assert proc.returncode != 0
+        assert "--extra_body must be a JSON object, not list" in output
+
+    def test_a_non_string_header_value_is_refused_here(self, tmp_path):
+        # httpx raises on one deep inside the first request otherwise
+        proc = self._cli_extras(tmp_path, "--extra_headers", '{"X-N": 1}')
+        output = " ".join((proc.stdout + proc.stderr).split())
+
+        assert proc.returncode != 0
+        assert "--extra_headers values must all be strings" in output
+
+    def test_a_route_that_builds_no_request_says_so_and_runs_on(self, tmp_path):
+        # google translates through a fixed engine: there is no request body
+        # for these to join, and dropping them silently is what this replaces
+        src = tmp_path / BOOK.name
+        src.write_bytes(BOOK.read_bytes())
+        proc = _cli(
+            "--book_name",
+            str(src),
+            "--api_format",
+            "google",
+            "--extra_body",
+            '{"a": 1}',
+            "--extra_headers",
+            '{"b": "c"}',
+            "--test",
+            "--test_num",
+            "1",
+        )
+        output = " ".join((proc.stdout + proc.stderr).split())
+
+        assert (
+            "--extra_body and --extra_headers are ignored by the google route" in output
+        )
+
+    def test_a_header_value_is_never_printed(self, tmp_path):
+        # a header is where a credential goes; echoing the value would put it
+        # in every log and CI artifact the run touches
+        proc = self._cli_extras(
+            tmp_path, "--extra_headers", '{"Authorization": "Bearer sk-SECRET"}'
+        )
+        output = proc.stdout + proc.stderr
+
+        assert "sk-SECRET" not in output
+        assert "Authorization" in output  # the name still says what was sent
+
+    def test_a_body_field_repeating_the_key_is_masked_in_the_echo(self, tmp_path):
+        # a gateway that wants the key in the body gets it repeated there;
+        # the body echo goes through redact() like every other sink
+        src = tmp_path / BOOK.name
+        src.write_bytes(BOOK.read_bytes())
+        proc = _cli(
+            "--book_name",
+            str(src),
+            "--key",
+            "sk-live-0123456789",
+            "--api_format",
+            "openai",
+            "--model",
+            "m",
+            "--test",
+            "--test_num",
+            "1",
+            "--extra_body",
+            '{"api_key": "sk-live-0123456789", "top_p": 0.9}',
+        )
+        output = proc.stdout + proc.stderr
+
+        assert "sk-live-0123456789" not in output
+        assert "api_key" in output and "top_p" in output
+
+    def test_both_flags_are_echoed_so_the_run_records_what_it_sent(self, tmp_path):
+        proc = self._cli_extras(
+            tmp_path,
+            "--extra_body",
+            '{"enable_thinking": false}',
+            "--extra_headers",
+            '{"X-Title": "bbm"}',
+        )
+        output = " ".join((proc.stdout + proc.stderr).split())
+
+        assert "enable_thinking" in output
+        assert "X-Title" in output
+
+
+# --------------------------------------------- the whole path, read back
+
+
+def test_the_written_epub_carries_each_translation_beside_its_source(tmp_path):
+    """The one check the CLI tests were missing: not the exit code, not the
+    plan, but the book. Run the real command against the offline stand-in,
+    then open what it wrote and find each translation as the paragraph
+    right after its original, with the original's class, in a content
+    document and not only in the nav."""
+    import zipfile
+
+    from bs4 import BeautifulSoup
+
+    proc, _ = _run(tmp_path, "--test", "--test_num", "2")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    output = tmp_path / "animal_farm_bilingual.epub"
+    assert output.exists(), proc.stdout + proc.stderr
+
+    with zipfile.ZipFile(output) as archive:
+        documents = {
+            name: archive.read(name).decode("utf-8")
+            for name in archive.namelist()
+            if name.endswith((".html", ".xhtml")) and "nav" not in name
+        }
+
+    def words(node):
+        return " ".join(node.get_text(" ").split())
+
+    placed = 0
+    for name, text in documents.items():
+        for paragraph in BeautifulSoup(text, "html.parser").find_all("p"):
+            translation = words(paragraph)
+            if not translation.startswith("[offline]"):
+                continue
+            source = paragraph.find_previous_sibling("p")
+            assert source is not None, f"{name}: a translation with nothing before it"
+            assert words(source) == translation[len("[offline]") :], name
+            assert source.get("class") == paragraph.get("class"), name
+            placed += 1
+    assert placed == 2, f"{placed} translations placed, 2 requested"

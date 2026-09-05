@@ -1,12 +1,12 @@
-<div align="center">
+<div align="left">
 
 # Bilingual Book Maker
 
 **中文 | [English](./README.md)**
 
+bilingual_book_maker 是一个 AI 翻译工具，使用 ChatGPT 帮助用户制作多语言版本的 epub/txt/md/srt/pdf 文件和图书。该工具仅适用于翻译进入公共版权领域的 epub/txt 图书，不适用于有版权的书籍。请在使用之前阅读项目的 **[免责声明](./disclaimer.md)**。
 
-bilingual_book_maker 是一个 AI 翻译工具，使用 AI 模型制作多语言版本的 epub/txt/md/srt 文件和图书。该工具仅适用于翻译进入公共版权领域的 epub/txt 图书，不适用于有版权的书籍。请在使用之前阅读项目的 **[免责声明](./disclaimer.md)**。
-
+[![Stars](https://img.shields.io/github/stars/yihong0618/bilingual_book_maker)](https://github.com/yihong0618/bilingual_book_maker/stargazers)
 [![CI](https://github.com/yihong0618/bilingual_book_maker/actions/workflows/make_test_ebook.yaml/badge.svg)](https://github.com/yihong0618/bilingual_book_maker/actions/workflows/make_test_ebook.yaml)
 [![PyPI](https://img.shields.io/pypi/v/bbook-maker.svg)](https://pypi.org/project/bbook-maker/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -17,6 +17,23 @@ bilingual_book_maker 是一个 AI 翻译工具，使用 AI 模型制作多语言
 </div>
 
 ![image](https://user-images.githubusercontent.com/15976103/222317531-a05317c5-4eee-49de-95cd-04063d9539d9.png)
+
+## 支持的接口
+
+支持 OpenAI 和 Anthropic 格式的接口。
+通常需要三个字段，使用官方接口时两个即可，模型如 `gpt-5.6-luna`（默认）、
+`claude-sonnet-4-6` 或 `deepseek-v4-flash-0731`。
+在 `--api_format` 填 `openai` 或 `anthropic` 即可指定 API 请求格式。
+该参数也可以选择常规翻译引擎（`google`、`caiyun`、`deepl`、`deeplfree`、
+`tencent`、`customapi`（非 OpenAI 格式），或填 `codex` 以使用你的 Codex 额度。
+
+`--provider` 是另一种传凭据的方式，通过 JSON 配置文件 `bbm_providers.json`。
+
+epub 标签分类仅在支持 JSON Schema 的接口上自动开启；不支持时只翻译 `p` 标签，
+因此诗歌等内容可能不会被翻译。详见计划模式。
+
+旧参数（`--model gpt4o`、`--model gemini`、`--openai_key` 等）仍然可用：详见
+[模型与语言](./docs/model_lang.md)。
 
 ## 准备
 
@@ -51,7 +68,7 @@ python3 make_book.py --book_name test_books/animal_farm.epub \
 使用[Codex](https://developers.openai.com/codex/cli)订阅：
 
 ```shell
-python3 make_book.py --book_name test_books/animal_farm.epub --model codex --test
+python3 make_book.py --book_name test_books/animal_farm.epub --model gpt-5.6-luna --api_format codex --test
 ```
 
 或者交给 coding agent
@@ -64,7 +81,7 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
 
 [^token]: 你可以在 [OpenAI](https://platform.openai.com/account/api-keys) 或 [Anthropic](https://console.anthropic.com/account/api-keys) 申请到 token。
 
-## 翻译服务
+## 接口参数
 
 - `--api_format` 指定接口说的 API：`openai`、`anthropic`、`gemini`、`qwen`、
   `groq`、`xai`、`litellm`、`codex`，或常规翻译引擎（`google`、`caiyun`、
@@ -72,20 +89,21 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
   那家的地址，所以格式加一个 `--key` 就是一条完整命令。
 - **其他 OpenAI 兼容 API**: `--api_base`（以 `/v1` 结尾）、
   `--key`即 API key，以及模型标识符 `--model`。省略 `--api_base`即使用openai官方API，
-  省略`--model`即使用gpt-5.6-luna。
+  省略`--model`即使用 gpt-5.6-luna。
 - 或使用`--provider`进行翻译: `bbm_providers.example.json` 里预设了以下厂家（Gemini、Qwen、xAI、Groq、OrcaRouter、Ollama、LiteLLM、DeepSeek、
   SiliconFlow、OpenRouter）：复制为 `bbm_providers.json`，并修改其中的key，
   例如`--provider gemini` 就是使用其中 Gemini 的api。
 - `--key` 可以写多个 key，英文逗号分隔，轮换使用。
 - `--use_context session` 使用会话模式翻译，并在8k上下文时进行压缩。
-- 旧的预设名和 key 参数仍然可用，见[从旧参数迁移](./docs/migration.md)。
+- 旧的预设名和 key 参数仍然可用，见 [从旧参数迁移](./docs/migration.md)。
 
+## 支持的翻译服务
 * DeepL
 
   使用 DeepL 封装的 api 进行翻译，需要付费。[DeepL Translator](https://rapidapi.com/splintPRO/api/dpl-translator) 来获得 token
 
   ```shell
-  python3 make_book.py --book_name test_books/animal_farm.epub --model deepl --deepl_key ${deepl_key}
+  python3 make_book.py --book_name test_books/animal_farm.epub --api_format deepl --key ${deepl_key}
   ```
 
 * DeepL free
@@ -96,7 +114,7 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
   python3 make_book.py --book_name test_books/animal_farm.epub --api_format deeplfree
   ```
 
-* Claude
+* [Claude](https://console.anthropic.com/docs)
 
   `claude-*` 的模型 ID 会自动选中 anthropic 格式。
 
@@ -127,15 +145,14 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
 
 * Qwen
 
-  百炼上的 [Qwen-MT](https://www.aliyun.com/product/dashscope)：它是翻译模型而不是
-  对话模型，请求里写的是源语言和目标语言而不是提示词。支持 qwen-mt-turbo（默认）
+  百炼上的 [Qwen-MT](https://www.aliyun.com/product/dashscope)：它是翻译模型，请求里写的是源语言和目标语言。支持 qwen-mt-turbo（默认）
   和 qwen-mt-plus，不想自动检测源语言时用 `--source_lang` 指定。
 
   ```shell
   python3 make_book.py --book_name test_books/animal_farm.epub --api_format qwen --key ${qwen_key} --model qwen-mt-turbo --language "Simplified Chinese"
   ```
 
-* 腾讯交互翻译
+* [腾讯交互翻译](https://transmart.qq.com)
 
   ```shell
   python3 make_book.py --book_name test_books/animal_farm.epub --api_format tencent
@@ -144,16 +161,20 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
 * [xAI](https://x.ai)
 
   ```shell
-  python3 make_book.py --book_name test_books/animal_farm.epub --api_format xai --key ${xai_key} --model grok-beta
+  python3 make_book.py --book_name test_books/animal_farm.epub --api_format xai --key ${xai_key} --model grok-4.3
   ```
 
 * [OrcaRouter](https://www.orcarouter.ai)
 
-  支持 [OrcaRouter](https://www.orcarouter.ai) 网关，默认使用 `orcarouter/auto` 智能路由模型。
+  [OrcaRouter](https://www.orcarouter.ai) 网关，默认使用 `orcarouter/auto` 智能路由。
+  地址随该路由自带，无需 `--api_base`；key 用 `--key` 或 `BBM_ORCAROUTER_API_KEY`。
+  `--provider orcarouter` 指向同一处。
 
   ```shell
   python3 make_book.py --book_name test_books/animal_farm.epub --model orcarouter --key ${orcarouter_key}
   ```
+
+  若要指定具体模型：`--provider orcarouter --model <模型 id>`。
 
 * [Ollama](https://github.com/ollama/ollama)
 
@@ -189,14 +210,14 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
   运行在沙箱中，shell、MCP 服务器、浏览全部关闭。但hooks可能仍会触发。
 
   ```shell
-  python3 make_book.py --book_name test_books/animal_farm.epub --model codex --language zh-hans
+  python3 make_book.py --book_name test_books/animal_farm.epub --api_format codex --language zh-hans
   ```
 
-* 自定义 API Provider
+## 自定义 API Provider
 
   内置模型不满足需求时，可以通过 JSON 配置文件自定义 provider。不需要改代码，就能使用任何 OpenAI 兼容 / Anthropic 格式的 API（DeepSeek、SiliconFlow、本地代理等）。
 
-  在当前目录创建 `bbm_providers.json`（全局配置放在 `~/.bbm/providers.json`）：
+  在当前目录创建 `bbm_providers.json`（也可放在 `~/.bbm/providers.json`）：
 
   ```json
   {
@@ -223,20 +244,20 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
   |------|------|------|
   | `api_style` | 是 | API请求格式：`openai`、`anthropic`、`gemini`、`qwen`、`groq`、`xai` 或 `litellm` |
   | `base_url` | 否 | API 地址。不填则使用该 api_style 的默认地址 |
-  | `default_models` | 否 | 默认模型列表。不填则必须通过 `--model_list` 指定 |
-  | `env_key` | 否 | 读取 API key 的环境变量名。不填则必须通过 `--api_key` 传入 |
+  | `default_models` | 否 | 默认模型列表。不填则必须通过 `--model` 指定 |
+  | `env_key` | 否 | 读取 API key 的环境变量名。不填则必须通过 `--key` 传入 |
 
   优先级：项目级 `./bbm_providers.json` 覆盖全局 `~/.bbm/providers.json`。
 
   `--model` 指定该 provider 下的模型；不写就用 `default_models` 的第一个。
 
   ```shell
-  python3 make_book.py --provider deepseek --api_key sk-xxx --book_name test_books/animal_farm.epub
+  python3 make_book.py --provider deepseek --key sk-xxx --book_name test_books/animal_farm.epub
 
   export BBM_DEEPSEEK_API_KEY=sk-xxx
   python3 make_book.py --provider deepseek --book_name test_books/animal_farm.epub
 
-  python3 make_book.py --provider deepseek --api_key sk-xxx --model_list deepseek-reasoner --book_name test_books/animal_farm.epub
+  python3 make_book.py --provider deepseek --key sk-xxx --model deepseek-reasoner --book_name test_books/animal_farm.epub
   ```
 
 ## 使用说明
@@ -255,7 +276,7 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
   | `gpt-5.6-luna` | `openai` | 默认值，OpenAI 官方地址 |
   | `claude-sonnet-4-6` | `anthropic` | Anthropic 官方地址 |
   | `gpt-4o-mini` | `openai` | OpenAI |
-  | `deepseek/deepseek-v4-flash-0731` | `openai` | 与`--api_base` 配合使用 |
+  | `deepseek-v4-flash-0731` | `openai` | 与`--api_base` 配合使用 |
   | `codex` | 即 `--api_format codex` | 通过 Codex CLI 使用 |
   | `orcarouter` | `openai` | 使用OrcaRouter，key 读取 `BBM_ORCAROUTER_API_KEY` |
 
@@ -284,7 +305,7 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
   | `deepl` | 需要：`--key` 或 `$BBM_DEEPL_API_KEY` | DeepL（付费） |
   | `deeplfree` | 不需要 | DeepL 免费版 |
   | `tencent` | 不需要 | 腾讯交互翻译，免费 |
-  | `customapi` | 不需要；`--api_base` 是你的翻译接口地址 | 自定义翻译 API |
+  | `customapi` | 不需要 |  `{text, source_lang, target_lang}` 格式的API |
 
 - `--source_lang`: 源语言，给需要显式声明的路线用：`--api_format qwen`（请求里就是一对语言）和 `--api_format customapi`，默认自动检测。
 
@@ -320,15 +341,16 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
   指定需要翻译的标签，使用逗号分隔多个标签。epub 由 html 文件组成，默认情况下，只翻译 `<p>` 中的内容。例如: `--translate-tags h1,h2,h3,p,div`
 
 - `--plan-classify`
-  **计划模式（仅 epub）**：使用进行翻译的模型或你的 codex / claude code 进行分类。
+  **计划模式（仅 epub）**：使用进行翻译的模型，或 codex / claude code，对 epub 标签进行分类。
 
-  取值决定由谁判断需要翻译的epub标签：
+  取值决定每个标签的翻译与否如何判断：
 
   - `auto`（默认）：书籍是 epub、且端点可应用 JSON Schema 时，问LLM该翻哪段。否则，以及计划失败时，仅翻译 `--translate-tags` 选中的标签。
   - `none`：不建计划，仅 `--translate-tags` 选中的标签。
   - `all`：翻译整个分区，不做分类。
   - `model`：使用进行翻译的 LLM 进行判断，然后翻译。可用 `--plan-classify-model X` 指定分类用的模型。
-  - `agent`：对选中书籍输出分类计划。并输出指引，直接复制至你的coding tool进行分类。
+  - `agent`：对选中书籍输出分类计划。并输出指引，直接复制至你的coding tool进行分类
+  （也可以自己手工完成）。之后再次以 `--plan-classify agent` 运行翻译。
 
   - `--plan-dry-run`：仅打印按标签签名分组的表格，写出 `<book>_plan.json` 后退出。同时遵守 `--only_filelist` / `--exclude_filelist`。
   - `<book>_plan.json`：翻译计划；想重新分类请先删除该文件。
@@ -347,10 +369,6 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
   指定不翻译其内部内容的 HTML 标签，多个标签用逗号分隔，默认 `sup,code`。
   例如 `--exclude-translate-tags code,pre`；传入空字符串
   `--exclude-translate-tags ""` 可取消默认排除。
-
-- `--book_from`
-
-  选项指定电子阅读器类型（现在只有 kobo 可用），并使用 `--device_path` 指定挂载点。
 
 - `--api_base ${url}`
 
@@ -379,7 +397,7 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
 - `--accumulated_num`:
 
   达到累计token数开始进行翻译。gpt3.5将total_token限制为4090。
-  例如，如果您使用`--accumulation_num 1600`，则可能会输出2200个令牌，另外200个令牌用于系统指令（system_message）和用户指令（user_message），1600+2200+200 = 4000，所以token接近极限。你必须选择一个自己合适的值，我们无法在发送之前判断是否达到限制
+  例如，如果您使用`--accumulated_num 1600`，则可能会输出2200个令牌，另外200个令牌用于系统指令（system_message）和用户指令（user_message），1600+2200+200 = 4000，所以token接近极限。你必须选择一个自己合适的值，我们无法在发送之前判断是否达到限制
 
 - `--use_context`:
   使用上下文模式翻译。
@@ -403,13 +421,13 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
 
     在 `8000` 下，整体花费预估为 window 模式的 0.5–1.1 倍，但携带数倍的上下文——具体比例取决于缓存折扣比例。我们计算发现（2026年8月），大部分模型价格`--context-compact-at 2500` 最省钱（约 0.4–0.5 倍）。
 
-- `--no-context-compact`:
+  - `--no-context-compact`:
 
-  仅 session 模式。跳过交接报告：历史仍在达到预算时滚动，但下一个窗口从空白开始，不继承摘要。更省钱，代价是接缝处的连续性。
+    仅 session 模式。跳过交接报告：历史仍在达到预算时滚动，但下一个窗口从空白开始，不继承摘要。更省钱，代价是接缝处的连续性。
 
 - `--temperature`:
 
-  设置 openai / anthropic 格式的采样温度（codex 格式没有这个设置）。
+  设置 openai / anthropic 格式的采样温度（旧模型）。
   如 `--temperature 0.7`。
 
 - `--block_size`:
@@ -420,6 +438,10 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
 - `--single_translate`:
 
   使用`--single_translate`只输出翻译后的图书，不创建双语版本。
+
+- `--no_disclosure`:
+
+  epub 输出默认标注为 AI 翻译（`google`、`deepl`、`caiyun`、`tencent`、`customapi` 引擎则标注为机器翻译）：工具作为译者写入 contributor，一行描述记录模型名，书末附一页翻译说明。`--no_disclosure` 去掉这三项。
 
 - `--translation_style`:
 
@@ -473,10 +495,40 @@ codex "你好，请使用bbm-plan帮我将这本书：test_books/animal_farm.epu
 - `--extra_body`:
 
   以 JSON 字符串向 ChatGPT/OpenAI 衍生请求路径透传额外参数，包括 OpenAI 风格的
-  自定义 provider，以及同样走这条请求路径的 `groq`、`xai`、`litellm` 和 `--model orcarouter`。其余格式会明说并忽略该参数。例如：
+  自定义 provider，以及同样走这条请求路径的 `groq`、`xai`、`litellm` 和 `--model orcarouter`，还有 `anthropic` 路径。其余格式会明说并忽略该参数。它同样会带到
+  能力探测与 JSON 各级请求上，因此端点是按本次运行真正发出的请求形状被评级的。例如：
 
   ```shell
   python3 make_book.py --book_name book.epub --extra_body '{"chat_template_kwargs":{"enable_thinking":false}}'
+  ```
+
+- `--extra_headers`:
+
+  以 JSON 字符串为每次请求追加 HTTP 头，适用范围同上。头设置在 client 上，因此
+  能力探测、模型校验与模型列表请求也会带上。值必须是字符串。
+
+  ```shell
+  python3 make_book.py --book_name book.epub --key ${openrouter_key} --api_base https://openrouter.ai/api/v1 --model anthropic/claude-haiku-4.5 --extra_headers '{"HTTP-Referer":"https://example.com","X-Title":"bilingual_book_maker"}'
+  ```
+
+  若端点拒绝了带这两个参数的请求，程序会明说，并把端点返回的原文一并打印，而不是
+  悄悄退回更简单的请求形状。
+
+  常见写法，供参考：
+
+  ```shell
+  # openai 路径 —— 关闭本地/vLLM chat template 的思考块
+  --extra_body '{"chat_template_kwargs": {"enable_thinking": false}}'
+  # openai 路径（chat completions）—— 推理力度与 token 上限，二者都没有独立 flag（是否支持视模型而定）
+  --extra_body '{"reasoning_effort": "low", "max_completion_tokens": 2000}'
+  # anthropic 路径 —— 关闭扩展思考，或带预算开启
+  --extra_body '{"thinking": {"type": "disabled"}}'
+  --extra_body '{"thinking": {"type": "enabled", "budget_tokens": 2000}}'
+
+  # OpenRouter 归属标识（显示在其后台）
+  --extra_headers '{"HTTP-Referer": "https://example.com", "X-Title": "bilingual_book_maker"}'
+  # 网关自身的鉴权或路由头（其值不会进日志）
+  --extra_headers '{"X-API-Key": "sk-gateway-..."}'
   ```
 
 - `--provider`:
@@ -516,6 +568,9 @@ python3 make_book.py --book_name test_books/animal_farm.epub --api_format custom
 # 使用自定义 provider（如 DeepSeek）
 python3 make_book.py --book_name test_books/animal_farm.epub --provider deepseek --language ja
 
+# 在多个模型之间轮换
+python3 make_book.py --book_name test_books/animal_farm.epub --key ${openai_key} --model_list gpt-5-mini,gpt-4o-mini
+
 # Translate contents in <div> and <p>
 python3 make_book.py --book_name test_books/animal_farm.epub --translate-tags div,p
 
@@ -526,9 +581,6 @@ python3 make_book.py --book_name test_books/animal_farm.epub --plan-classify all
 python3 make_book.py --book_name test_books/animal_farm.epub --prompt prompt_template_sample.txt
 # 或者
 python3 make_book.py --book_name test_books/animal_farm.epub --prompt "Please translate \`{text}\` to {language}"
-# 翻译 kobo e-reader 中，來自 Rakuten Kobo 的书籍
-python3 make_book.py --book_from kobo --device_path /tmp/kobo
-
 # 翻译 txt 文件
 python3 make_book.py --book_name test_books/the_little_prince.txt --test
 # 聚合多行翻译 txt 文件
